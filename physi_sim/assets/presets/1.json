@@ -1,0 +1,89 @@
+{
+  "entity_id_placeholder": "preset_entity_id",
+  "components": [
+    {
+      "type": "IdentifierComponent",
+      "data": {
+        "id": "4558ac3d-9813-4b11-90a7-f3054993e952",
+        "name": "New Rectangle",
+        "type_tags": []
+      }
+    },
+    {
+      "type": "TransformComponent",
+      "data": {
+        "position": {
+          "x": 0.21777777777777865,
+          "y": 1.1288888888888893
+        },
+        "angle": 0.0,
+        "scale": {
+          "x": 1.0,
+          "y": 1.0
+        }
+      }
+    },
+    {
+      "type": "GeometryComponent",
+      "data": {
+        "shape_type": "RECTANGLE",
+        "parameters": {
+          "width": 4.559999999999998,
+          "height": 0.7911111111111108
+        },
+        "is_solid": true,
+        "is_boundary_only": false
+      }
+    },
+    {
+      "type": "RenderComponent",
+      "data": {
+        "fill_color": [
+          128,
+          128,
+          128,
+          255
+        ],
+        "stroke_color": [
+          0,
+          0,
+          0,
+          255
+        ],
+        "stroke_width": 1.0,
+        "visible": true,
+        "z_order": 0
+      }
+    },
+    {
+      "type": "PhysicsBodyComponent",
+      "data": {
+        "mass": 1.0,
+        "moment_of_inertia": 1.7849547325102864,
+        "velocity": {
+          "x": 0.0,
+          "y": 0.0
+        },
+        "angular_velocity": 0.0,
+        "is_fixed": false,
+        "restitution": 0.5,
+        "static_friction_coefficient": 0.6,
+        "dynamic_friction_coefficient": 0.4,
+        "previous_acceleration": {
+          "x": 0.0,
+          "y": 0.0
+        }
+      }
+    },
+    {
+      "type": "ForceAccumulatorComponent",
+      "data": {
+        "net_force": {
+          "x": 0.0,
+          "y": 0.0
+        },
+        "net_torque": 0.0
+      }
+    }
+  ]
+}

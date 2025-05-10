@@ -1,0 +1,117 @@
+{
+  "entity_id_placeholder": "preset_entity_id",
+  "components": [
+    {
+      "type": "IdentifierComponent",
+      "data": {
+        "id": "5a1f509df6a741e7a2ed9a62083b2e4c",
+        "name": "FallingCircle",
+        "type_tags": []
+      }
+    },
+    {
+      "type": "TransformComponent",
+      "data": {
+        "position": {
+          "x": 282.25073702261227,
+          "y": 198.26457982860276
+        },
+        "rotation": 0.0,
+        "scale": {
+          "x": 1.0,
+          "y": 1.0
+        }
+      }
+    },
+    {
+      "type": "GeometryComponent",
+      "data": {
+        "shape_type": "CIRCLE",
+        "parameters": {
+          "radius": 30.0
+        },
+        "is_solid": true,
+        "is_boundary_only": false
+      }
+    },
+    {
+      "type": "RenderComponent",
+      "data": {
+        "fill_color": [
+          0,
+          100,
+          255,
+          255
+        ],
+        "stroke_color": [
+          0,
+          0,
+          0,
+          255
+        ],
+        "stroke_width": 1.0,
+        "visible": true,
+        "z_order": 0
+      }
+    },
+    {
+      "type": "PhysicsBodyComponent",
+      "data": {
+        "mass": 2.0,
+        "moment_of_inertia": 1.0,
+        "velocity": {
+          "x": 20.0,
+          "y": 40.33872000000004
+        },
+        "angular_velocity": 0.0,
+        "is_fixed": false,
+        "restitution": 0.7,
+        "static_friction_coefficient": 0.5,
+        "dynamic_friction_coefficient": 0.3
+      }
+    },
+    {
+      "type": "ForceAccumulatorComponent",
+      "data": {
+        "net_force": {
+          "x": 0.0,
+          "y": 0.0
+        },
+        "net_torque": 0.0
+      }
+    },
+    {
+      "type": "ScriptExecutionComponent",
+      "data": {
+        "on_create": null,
+        "on_update": "\n# Example script for the blue circle\nmy_id = current_entity_id\npos = system_api.get_position(my_id)\nvel = system_api.get_velocity(my_id)\n\n# Print position every second or so\nif 'last_log_time' not in variables:\n    variables['last_log_time'] = -1.0\n\nif time >= variables['last_log_time'] + 1.0:\n    # system_api.log(f\"Circle {my_id} at {pos}, vel {vel}, time {time}\")\n    variables['last_log_time'] = time\n\n# Apply a small upward force if below a certain y-level (e.g., y > 500)\nif pos and pos[1] > 500:\n     system_api.apply_force(my_id, (0, -20.0)) # Apply upward force (counteracting gravity slightly)\n     # Change color to indicate force application\n     # system_api.set_color(my_id, (255, 255, 0, 255)) # Need a set_color API method\n\n# Store current velocity magnitude\nif vel:\n    variables['speed'] = (vel[0]**2 + vel[1]**2)**0.5\n",
+        "on_collision": null,
+        "custom_event_listeners": {},
+        "script_variables": {
+          "last_log_time": 4.032000000000003,
+          "speed": 45.02457474800182
+        }
+      }
+    },
+    {
+      "type": "ConnectionComponent",
+      "data": {
+        "target_entity_id": "782d3147-89dc-4f6f-a3b4-620914a4dab3",
+        "connection_type": "ROD",
+        "parameters": {
+          "length": 100.0
+        },
+        "connection_point_a": {
+          "x": 0,
+          "y": 0
+        },
+        "connection_point_b": {
+          "x": 0,
+          "y": 0
+        },
+        "break_threshold": null,
+        "is_broken": false
+      }
+    }
+  ]
+}
