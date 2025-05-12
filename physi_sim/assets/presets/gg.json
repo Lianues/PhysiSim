@@ -1,0 +1,209 @@
+{
+  "preset_type": "group",
+  "entities": [
+    {
+      "local_id": 0,
+      "components": [
+        {
+          "type": "IdentifierComponent",
+          "data": {
+            "id": "fcc2239f-cff6-42b5-bff8-247685abdcb6",
+            "name": "New Rectangle",
+            "type_tags": []
+          }
+        },
+        {
+          "type": "TransformComponent",
+          "data": {
+            "position": {
+              "x": 0.0,
+              "y": 0.0
+            },
+            "angle": 0.0,
+            "scale": {
+              "x": 1.0,
+              "y": 1.0
+            }
+          }
+        },
+        {
+          "type": "GeometryComponent",
+          "data": {
+            "shape_type": "RECTANGLE",
+            "parameters": {
+              "width": 0.7466666666666664,
+              "height": 2.6133333333333337
+            },
+            "is_solid": true,
+            "is_boundary_only": false
+          }
+        },
+        {
+          "type": "RenderComponent",
+          "data": {
+            "fill_color": [
+              128,
+              128,
+              128,
+              255
+            ],
+            "stroke_color": [
+              0,
+              0,
+              0,
+              255
+            ],
+            "stroke_width": 1.0,
+            "visible": true,
+            "z_order": 0
+          }
+        },
+        {
+          "type": "PhysicsBodyComponent",
+          "data": {
+            "mass": 1.0,
+            "moment_of_inertia": 0.6155851851851852,
+            "velocity": {
+              "x": 0.0,
+              "y": 0.0
+            },
+            "angular_velocity": 0.0,
+            "is_fixed": false,
+            "restitution": 0.5,
+            "static_friction_coefficient": 0.6,
+            "dynamic_friction_coefficient": 0.4,
+            "auto_calculate_inertia": false,
+            "previous_acceleration": {
+              "x": 0.0,
+              "y": 0.0
+            }
+          }
+        },
+        {
+          "type": "ForceAccumulatorComponent",
+          "data": {
+            "net_force": {
+              "x": 0.0,
+              "y": 0.0
+            },
+            "net_torque": 0.0,
+            "detailed_forces": []
+          }
+        }
+      ]
+    },
+    {
+      "local_id": 1,
+      "components": [
+        {
+          "type": "IdentifierComponent",
+          "data": {
+            "id": "f9362d88-bc20-4b3c-a2ff-3bcdcd9e31b2",
+            "name": "New Rectangle",
+            "type_tags": []
+          }
+        },
+        {
+          "type": "TransformComponent",
+          "data": {
+            "position": {
+              "x": -2.0933333333333333,
+              "y": 1.9266666666666663
+            },
+            "angle": 0.0,
+            "scale": {
+              "x": 1.0,
+              "y": 1.0
+            }
+          }
+        },
+        {
+          "type": "GeometryComponent",
+          "data": {
+            "shape_type": "RECTANGLE",
+            "parameters": {
+              "width": 1.36,
+              "height": 1.08
+            },
+            "is_solid": true,
+            "is_boundary_only": false
+          }
+        },
+        {
+          "type": "RenderComponent",
+          "data": {
+            "fill_color": [
+              128,
+              128,
+              128,
+              255
+            ],
+            "stroke_color": [
+              0,
+              0,
+              0,
+              255
+            ],
+            "stroke_width": 1.0,
+            "visible": true,
+            "z_order": 0
+          }
+        },
+        {
+          "type": "PhysicsBodyComponent",
+          "data": {
+            "mass": 1.0,
+            "moment_of_inertia": 0.25133333333333335,
+            "velocity": {
+              "x": 0.0,
+              "y": 0.0
+            },
+            "angular_velocity": 0.0,
+            "is_fixed": false,
+            "restitution": 0.5,
+            "static_friction_coefficient": 0.6,
+            "dynamic_friction_coefficient": 0.4,
+            "auto_calculate_inertia": false,
+            "previous_acceleration": {
+              "x": 0.0,
+              "y": 0.0
+            }
+          }
+        },
+        {
+          "type": "ForceAccumulatorComponent",
+          "data": {
+            "net_force": {
+              "x": 0.0,
+              "y": 0.0
+            },
+            "net_torque": 0.0,
+            "detailed_forces": []
+          }
+        }
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "source_entity_id": 1,
+      "target_entity_id": 0,
+      "id": "20c392c2-bab0-47c5-bf1b-d837520cff56",
+      "connection_type": "ROD",
+      "parameters": {
+        "target_length": 2.85
+      },
+      "connection_point_a": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "connection_point_b": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "break_threshold": null,
+      "is_broken": false,
+      "original_component_type": "ConnectionComponent"
+    }
+  ]
+}

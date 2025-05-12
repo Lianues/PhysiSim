@@ -584,9 +584,8 @@ class SceneSerializer:
             components_for_entity = entity_manager.get_all_components_for_entity(original_entity_id)
             if components_for_entity:
                 for component_instance in components_for_entity.values():
-                    # Skip serializing ConnectionComponents here as they are handled separately
-                    # to ensure their entity references are correctly mapped to local IDs.
-                    if isinstance(component_instance, components_module.ConnectionComponent):
+                    # Skip serializing ConnectionComponents and SpringComponents here as they are handled separately
+                    if isinstance(component_instance, (components_module.ConnectionComponent, components_module.SpringComponent)):
                         continue
 
                     component_dict = self._component_to_dict(component_instance)
@@ -609,59 +608,89 @@ class SceneSerializer:
             
             preset_data["entities"].append(entity_preset_data)
 
-        # Serialize connections using the provided connection_ids (UUIDs of ConnectionComponent instances)
-        all_connection_components_in_scene = entity_manager.get_all_independent_components_of_type(components_module.ConnectionComponent)
+        # Serialize connections (Springs and Rods/Ropes)
+        all_connections_from_em: List[Union[components_module.ConnectionComponent, components_module.SpringComponent]] = []
+        all_connections_from_em.extend(entity_manager.get_all_independent_components_of_type(components_module.ConnectionComponent))
+        all_connections_from_em.extend(entity_manager.get_all_independent_components_of_type(components_module.SpringComponent))
         
-        for conn_id_to_find in connection_ids:
-            conn_comp_instance_to_serialize: Optional[components_module.ConnectionComponent] = None
-            for conn_comp in all_connection_components_in_scene:
-                # ConnectionComponent has an 'id' field which is its own UUID
-                if hasattr(conn_comp, 'id') and conn_comp.id == conn_id_to_find:
-                    conn_comp_instance_to_serialize = cast(components_module.ConnectionComponent, conn_comp)
+        # DEBUG: Print all available connection component IDs from EntityManager
+        print(f"DEBUG_SERIALIZER: All Connection/Spring IDs in EntityManager at serialization time ({len(all_connections_from_em)} total):")
+        available_em_conn_ids = set()
+        for comp_instance_debug in all_connections_from_em:
+            if hasattr(comp_instance_debug, 'id') and isinstance(comp_instance_debug.id, UUID):
+                print(f"  - EM Stored {type(comp_instance_debug).__name__} ID: {comp_instance_debug.id}")
+                available_em_conn_ids.add(comp_instance_debug.id)
+            else:
+                print(f"  - EM Stored Component instance has no valid 'id': {comp_instance_debug}")
+        
+        print(f"DEBUG_SERIALIZER: Selected connection_ids to find ({len(connection_ids)} total):")
+        for sel_id in connection_ids:
+            print(f"  - Selected ID: {sel_id}")
+
+
+        for conn_id_to_find in connection_ids: # conn_id_to_find is a UUID
+            conn_comp_instance_to_serialize: Optional[Union[components_module.ConnectionComponent, components_module.SpringComponent]] = None
+            
+            for comp_instance_from_em in all_connections_from_em:
+                if hasattr(comp_instance_from_em, 'id') and comp_instance_from_em.id == conn_id_to_find:
+                    conn_comp_instance_to_serialize = comp_instance_from_em
                     break
             
             if not conn_comp_instance_to_serialize:
-                print(f"Warning: ConnectionComponent with ID '{conn_id_to_find}' not found in EntityManager. Skipping for preset.")
+                print(f"Warning: Connection or Spring Component with ID '{conn_id_to_find}' not found in EntityManager. Skipping for preset.")
+                if conn_id_to_find not in available_em_conn_ids:
+                    print(f"  Further Info: The ID {conn_id_to_find} was NOT in the set of ConnectionComponent or SpringComponent IDs printed from EntityManager.")
                 continue
 
-            # Ensure both entities of the connection are part of the selected group
-            source_entity_uuid = conn_comp_instance_to_serialize.source_entity_id # Changed attribute name
-            target_entity_uuid = conn_comp_instance_to_serialize.target_entity_id # Changed attribute name
+            is_spring = isinstance(conn_comp_instance_to_serialize, components_module.SpringComponent)
+            
+            if is_spring:
+                spring_instance = cast(components_module.SpringComponent, conn_comp_instance_to_serialize)
+                entity_one_uuid = spring_instance.entity_a_id
+                entity_two_uuid = spring_instance.entity_b_id
+                id_field_for_remap_one = 'entity_a_id'
+                id_field_for_remap_two = 'entity_b_id'
+            else: # Is ConnectionComponent
+                conn_instance_typed = cast(components_module.ConnectionComponent, conn_comp_instance_to_serialize)
+                entity_one_uuid = conn_instance_typed.source_entity_id
+                entity_two_uuid = conn_instance_typed.target_entity_id
+                id_field_for_remap_one = 'source_entity_id'
+                id_field_for_remap_two = 'target_entity_id'
 
-            if source_entity_uuid not in local_id_map or target_entity_uuid not in local_id_map:
-                print(f"Warning: ConnectionComponent (ID: {conn_id_to_find}) links to one or more entities "
-                      f"not in the selected group ({source_entity_uuid}, {target_entity_uuid}). Skipping.")
+            if entity_one_uuid not in local_id_map or entity_two_uuid not in local_id_map:
+                print(f"Warning: Component (ID: {conn_id_to_find}, Type: {type(conn_comp_instance_to_serialize).__name__}) links to one or more entities "
+                      f"not in the selected group ({entity_one_uuid}, {entity_two_uuid}). Skipping.")
                 continue
 
             conn_serialized_data_full = self._component_to_dict(conn_comp_instance_to_serialize)
             
-            # We need the 'data' part of the serialized component
             if 'data' in conn_serialized_data_full and isinstance(conn_serialized_data_full['data'], dict):
                 conn_data_to_modify = conn_serialized_data_full['data']
                 
-                # Remap source_entity_id and target_entity_id to local integer IDs
-                # _component_to_dict already converts UUIDs to strings.
-                original_source_uuid_str = conn_data_to_modify.get('source_entity_id') # Changed key
-                original_target_uuid_str = conn_data_to_modify.get('target_entity_id') # Changed key
+                original_entity_one_uuid_str = conn_data_to_modify.get(id_field_for_remap_one)
+                original_entity_two_uuid_str = conn_data_to_modify.get(id_field_for_remap_two)
 
-                if original_source_uuid_str and original_target_uuid_str:
+                if original_entity_one_uuid_str and original_entity_two_uuid_str:
                     try:
-                        # These were already asserted to be in local_id_map
-                        conn_data_to_modify['source_entity_id'] = local_id_map[UUID(original_source_uuid_str)] # Changed key
-                        conn_data_to_modify['target_entity_id'] = local_id_map[UUID(original_target_uuid_str)] # Changed key
+                        conn_data_to_modify[id_field_for_remap_one] = local_id_map[UUID(original_entity_one_uuid_str)]
+                        conn_data_to_modify[id_field_for_remap_two] = local_id_map[UUID(original_entity_two_uuid_str)]
                         
-                        # Add the modified 'data' part to the preset's connections list
+                        # Add original component type to distinguish during deserialization
+                        conn_data_to_modify['original_component_type'] = conn_comp_instance_to_serialize.__class__.__name__
+                        
                         preset_data["connections"].append(conn_data_to_modify)
                     except ValueError:
-                        print(f"Warning: Could not parse UUIDs for ConnectionComponent "
-                              f"(ID: {conn_comp_instance_to_serialize.id}). Skipping.")
+                        print(f"Warning: Could not parse UUIDs for Component (ID: {conn_comp_instance_to_serialize.id}, "
+                              f"Type: {type(conn_comp_instance_to_serialize).__name__}). Skipping.")
                     except KeyError as e:
-                        print(f"Warning: Entity ID from ConnectionComponent {conn_comp_instance_to_serialize.id} not in local_id_map: {e}. Skipping.")
+                        print(f"Warning: Entity ID from Component {conn_comp_instance_to_serialize.id} "
+                              f"(Type: {type(conn_comp_instance_to_serialize).__name__}) not in local_id_map: {e}. Skipping.")
                 else:
-                    print(f"Warning: ConnectionComponent (ID: {conn_comp_instance_to_serialize.id}) "
-                          f"missing source_entity_id or target_entity_id in serialized data. Skipping.") # Changed message
+                    print(f"Warning: Component (ID: {conn_comp_instance_to_serialize.id}, Type: {type(conn_comp_instance_to_serialize).__name__}) "
+                          f"missing '{id_field_for_remap_one}' or '{id_field_for_remap_two}' in serialized data. Skipping.")
             else:
-                print(f"Warning: Serialized data for ConnectionComponent (ID: {conn_comp_instance_to_serialize.id}) is malformed. Skipping.")
+                print(f"Warning: Serialized data for Component (ID: {conn_comp_instance_to_serialize.id}, "
+                      f"Type: {type(conn_comp_instance_to_serialize).__name__}) is malformed. Skipping.")
                       
         return preset_data
 
