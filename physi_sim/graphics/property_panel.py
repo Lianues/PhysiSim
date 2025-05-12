@@ -428,7 +428,7 @@ class PropertyPanel(QWidget):
                     if conn_component.connection_type == ConnectionType.ROD: # Use Enum
                         param_keys_to_edit = ["target_length"]
                     elif conn_component.connection_type == ConnectionType.ROPE: # Use Enum
-                        param_keys_to_edit = ["natural_length"]
+                        param_keys_to_edit = ["natural_length", "stiffness", "damping"] # Added stiffness and damping
 
                     for param_key in param_keys_to_edit:
                         param_val = current_parameters_dict.get(param_key)

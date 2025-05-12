@@ -1,7 +1,7 @@
 import json
 import logging
 import os
-from typing import Optional, List, Tuple # Added List, Tuple
+from typing import Optional, List, Tuple, Dict # Added List, Tuple, Dict
 from uuid import UUID # Import UUID for type hinting
 import uuid # Keep this for generating UUIDs if needed elsewhere
 from physi_sim.core.vector import Vector2D # Added for type hinting
@@ -146,24 +146,43 @@ class SceneManager:
         """
         return self.current_scene_filepath
 
-    def save_entity_as_preset(self, entity_id: UUID, preset_name: str) -> bool: # Changed entity_id type hint to UUID
+    def save_selection_as_preset(
+        self,
+        preset_name: str,
+        selected_entity_ids: List[UUID],
+        selected_connection_ids: List[UUID]
+    ) -> bool:
         """
-        Saves a specific entity from the current scene as a preset.
+        Saves the selected entities and their connections as a composite preset.
 
         Args:
-            entity_id: The ID of the entity to save as a preset.
             preset_name: The name for the preset (filename without extension).
+            selected_entity_ids: A list of UUIDs for the selected entities.
+            selected_connection_ids: A list of UUIDs for the selected connections (ConnectionComponent instances).
 
         Returns:
             True if saving was successful, False otherwise.
         """
-        # entity_id is now expected to be a UUID object
-        logger.info(f"Attempting to save entity UUID '{entity_id}' as preset '{preset_name}'")
-        if entity_id not in self.entity_manager.entities: # Check using UUID object
-            logger.error(f"Entity UUID '{entity_id}' not found. Cannot save as preset.")
+        logger.info(f"Attempting to save selection as preset '{preset_name}'")
+        if not selected_entity_ids:
+            logger.warning("No entities selected. Cannot save as preset.")
             return False
 
-        # Sanitize preset_name to be a valid filename (basic sanitization)
+        # Determine group anchor (e.g., position of the first selected entity)
+        group_anchor_world_pos = Vector2D(0, 0) # Default anchor
+        first_entity_id = selected_entity_ids[0]
+        if first_entity_id in self.entity_manager.entities:
+            from physi_sim.core.component import TransformComponent # Local import
+            transform_comp = self.entity_manager.get_component(first_entity_id, TransformComponent)
+            if transform_comp:
+                group_anchor_world_pos = transform_comp.position
+            else:
+                logger.warning(f"First selected entity {first_entity_id} has no TransformComponent. Using default anchor (0,0).")
+        else:
+            logger.warning(f"First selected entity {first_entity_id} not found. Using default anchor (0,0).")
+
+
+        # Sanitize preset_name
         safe_preset_name = "".join(c for c in preset_name if c.isalnum() or c in (' ', '_', '-')).rstrip()
         if not safe_preset_name:
             logger.error(f"Invalid preset name '{preset_name}' after sanitization. Cannot save.")
@@ -173,97 +192,185 @@ class SceneManager:
         filepath = os.path.join(self.PRESETS_DIR, filename)
 
         try:
-            # Pass the UUID object directly to the serializer
-            preset_data = self.serializer.serialize_entity_to_preset_dict(self.entity_manager, entity_id)
-            if not preset_data: # serialize_entity_to_preset_dict might return empty if entity not found
-                logger.error(f"Failed to serialize entity UUID '{entity_id}' for preset '{preset_name}'.")
+            preset_data = self.serializer.serialize_object_group_to_preset_data(
+                selected_entity_ids,
+                selected_connection_ids,
+                self.entity_manager,
+                group_anchor_world_pos
+            )
+
+            if not preset_data or not preset_data.get("entities"):
+                logger.error(f"Failed to serialize selection for preset '{preset_name}'. No data generated.")
                 return False
 
-            # Custom default function for json.dump to handle UUID
-            def json_default_serializer(obj):
-                if isinstance(obj, uuid.UUID):
-                    return str(obj)
-                # Let the base class default method raise the TypeError
-                # Or handle other types here if needed
-                raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
-            
-            # --- DEBUG: Print the data just before json.dump ---
-            print(f"DEBUG: Data before json.dump in save_entity_as_preset: {preset_data}")
-            # --- END DEBUG ---
-
             with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(preset_data, f, indent=2, default=json_default_serializer)
+                json.dump(preset_data, f, indent=2) # UUIDs are handled as strings by _component_to_dict
             
-            logger.info(f"Entity '{entity_id}' saved successfully as preset to {filepath}")
+            logger.info(f"Selection saved successfully as preset to {filepath}")
             return True
         except IOError as e:
             logger.error(f"IOError saving preset '{preset_name}' to {filepath}: {e}")
         except Exception as e:
-            logger.error(f"Unexpected error saving preset '{preset_name}' to {filepath}: {e}")
+            logger.error(f"Unexpected error saving preset '{preset_name}' to {filepath}: {e}", exc_info=True)
         return False
 
-    def load_preset_to_scene(
+    def load_preset(
         self,
         preset_name: str,
-        target_position: Vector2D,
-        name_override: Optional[str] = None
-    ) -> Optional[str]:
+        load_position_world: Vector2D,
+        name_override: Optional[str] = None, # Note: Name override for group presets might need more complex logic
+        initial_velocity: Optional[Vector2D] = None # TODO: Implement initial_velocity for group presets
+    ) -> List[UUID]:
         """
-        Loads a preset and adds it as a new entity to the current scene.
+        Loads a preset (either single entity or group) and adds it to the current scene.
 
         Args:
-            preset_name: The name of the preset to load (filename without extension).
-            target_position: The position where the new entity should be placed.
-            name_override: Optional new name for the entity (for its IdentifierComponent).
+            preset_name: The name of the preset to load.
+            load_position_world: The world position where the preset (or its anchor) should be placed.
+            name_override: Optional new name. For single entity presets, it renames the entity.
+                           For group presets, its application might be more complex (e.g., prefixing).
+            initial_velocity: Optional initial velocity for the loaded objects.
 
         Returns:
-            The ID of the newly created entity if successful, None otherwise.
+            A list of UUIDs of the newly created entities if successful, an empty list otherwise.
         """
-        logger.info(f"Attempting to load preset '{preset_name}' to scene.")
-        filename = f"{preset_name}.json" # Assume preset_name is already sanitized or valid
+        logger.info(f"Attempting to load preset '{preset_name}' to scene at {load_position_world}.")
+        filename = f"{preset_name}.json"
         filepath = os.path.join(self.PRESETS_DIR, filename)
 
         if not os.path.exists(filepath):
             logger.error(f"Preset file not found: {filepath}")
-            return None
+            return []
 
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
                 preset_data = json.load(f)
-            
-            # Generate a new unique ID for the entity being loaded from preset
-            # Let EntityManager handle the creation and return the actual UUID object
-            actual_entity_uuid = self.entity_manager.create_entity()
-            # Ensure entity_manager can create an entity with this ID or uses it.
-            # The SceneSerializer's deserialize_preset_dict_to_entity will add components to this ID.
-            # If entity_manager.create_entity actually returns an ID, use that instead.
-            # For now, assuming new_entity_id is passed directly.
-            
-            # It's good practice to "create" the entity in EntityManager first if it has such a method
-            # that doesn't require components immediately, or if add_component implicitly creates it.
-            # Let's assume add_component will handle creation if new_entity_id doesn't exist.
-            # self.entity_manager.create_entity(new_entity_id) # This line is now handled by the call above that assigns to actual_entity_uuid
- 
-            created_entity_id = self.serializer.deserialize_preset_dict_to_entity(
-                preset_data,
-                self.entity_manager,
-                actual_entity_uuid, # Pass the UUID object
-                target_position,
-                name_override
-            )
-            
-            logger.info(f"Preset '{preset_name}' loaded successfully as new entity '{created_entity_id}' at {target_position}.")
-            return created_entity_id
-        except FileNotFoundError: # Should be caught by os.path.exists, but good to have
+
+            created_entity_ids: List[UUID] = []
+
+            # Check if it's a new group preset or an old single-entity preset
+            if preset_data.get("preset_type") == "group":
+                logger.info(f"Loading group preset: {preset_name}")
+                from physi_sim.core.component import TransformComponent, ConnectionComponent # Local import
+                
+                local_to_global_id_map: Dict[int, UUID] = {}
+
+                # 1. Load Entities
+                for entity_data_in_preset in preset_data.get("entities", []):
+                    local_id = entity_data_in_preset.get("local_id")
+                    components_json_list = entity_data_in_preset.get("components", [])
+                    
+                    if local_id is None:
+                        logger.warning(f"Entity in group preset '{preset_name}' missing local_id. Skipping.")
+                        continue
+
+                    new_scene_entity_id = self.entity_manager.create_entity()
+                    local_to_global_id_map[local_id] = new_scene_entity_id
+                    created_entity_ids.append(new_scene_entity_id)
+
+                    for component_json_item_dict in components_json_list:
+                        component_instance = self.serializer._dict_to_component(component_json_item_dict, self.entity_manager)
+                        if component_instance:
+                            if isinstance(component_instance, TransformComponent):
+                                # Position in preset is relative to group anchor
+                                relative_pos_dict = component_json_item_dict.get("data", {}).get("position", {})
+                                if 'x' in relative_pos_dict and 'y' in relative_pos_dict:
+                                    relative_pos = Vector2D(relative_pos_dict['x'], relative_pos_dict['y'])
+                                    component_instance.position = load_position_world + relative_pos
+                                else: # Should not happen if serialization was correct
+                                     component_instance.position = load_position_world
+                            
+                            # TODO: Handle name_override for group entities (e.g., prefixing)
+                            # TODO: Handle initial_velocity for PhysicsBodyComponent
+
+                            self.entity_manager.add_component(new_scene_entity_id, component_instance)
+                
+                # 2. Load Connections
+                for conn_data_in_preset in preset_data.get("connections", []):
+                    # conn_data_in_preset is already the "data" part of a ConnectionComponent serialization
+                    # It needs to be wrapped to look like a full component dict for _dict_to_component
+                    
+                    local_source_entity_id = conn_data_in_preset.get("source_entity_id") # Changed key
+                    local_target_entity_id = conn_data_in_preset.get("target_entity_id") # Changed key
+
+                    if local_source_entity_id is None or local_target_entity_id is None: # Changed variable names
+                        logger.warning(f"Connection in group preset '{preset_name}' missing local entity IDs. Skipping.")
+                        continue
+                    
+                    global_source_entity_id = local_to_global_id_map.get(local_source_entity_id) # Changed variable name
+                    global_target_entity_id = local_to_global_id_map.get(local_target_entity_id) # Changed variable name
+
+                    if not global_source_entity_id or not global_target_entity_id: # Changed variable names
+                        logger.warning(f"Could not map local entity IDs for a connection in '{preset_name}'. Skipping.")
+                        continue
+                    
+                    # Create a temporary full component dict for deserialization
+                    # The 'type' is ConnectionComponent.__name__
+                    # The 'data' is conn_data_in_preset, but with entity IDs replaced
+                    
+                    # Create a copy to modify
+                    modified_conn_data = dict(conn_data_in_preset)
+                    modified_conn_data["source_entity_id"] = str(global_source_entity_id) # Changed key and variable name
+                    modified_conn_data["target_entity_id"] = str(global_target_entity_id) # Changed key and variable name
+                    
+                    # The ConnectionComponent itself needs a unique ID if it's stored independently
+                    # Let's assume ConnectionComponent from preset might not have its own 'id' field in 'data'
+                    # or if it does, it's irrelevant as a new one will be generated by EntityManager.
+                    # If ConnectionComponent instances are expected to have their own persistent UUIDs stored
+                    # in the preset and reused, this logic needs adjustment.
+                    # For now, let's assume new ConnectionComponents are created.
+                    if 'id' in modified_conn_data: # Remove preset's own connection ID if present
+                        del modified_conn_data['id']
+
+
+                    temp_conn_component_json = {
+                        "type": ConnectionComponent.__name__,
+                        "data": modified_conn_data
+                    }
+                    
+                    conn_instance = self.serializer._dict_to_component(temp_conn_component_json, self.entity_manager)
+                    if conn_instance and isinstance(conn_instance, ConnectionComponent):
+                        # Ensure the instance has the correct global UUIDs if _dict_to_component didn't fully set them
+                        # (though it should if the data was prepared correctly)
+                        conn_instance.source_entity_id = global_source_entity_id # Changed attribute name
+                        conn_instance.target_entity_id = global_target_entity_id # Changed attribute name
+                        
+                        # ConnectionComponents are independent, add them as such
+                        self.entity_manager.add_independent_component(conn_instance)
+                    else:
+                        logger.warning(f"Failed to create ConnectionComponent instance from preset '{preset_name}'. Data: {modified_conn_data}")
+
+            else: # Old single-entity preset
+                logger.info(f"Loading single-entity preset: {preset_name}")
+                actual_entity_uuid = self.entity_manager.create_entity()
+                # Pass the UUID object
+                created_id_obj = self.serializer.deserialize_preset_dict_to_entity(
+                    preset_data,
+                    self.entity_manager,
+                    actual_entity_uuid,
+                    load_position_world,
+                    name_override
+                )
+                if created_id_obj:
+                    created_entity_ids.append(created_id_obj)
+                # TODO: Handle initial_velocity for single entity preset
+
+            if created_entity_ids:
+                logger.info(f"Preset '{preset_name}' loaded successfully. Created entities: {created_entity_ids}")
+            else:
+                logger.warning(f"Preset '{preset_name}' loaded, but no entities were created.")
+            return created_entity_ids
+
+        except FileNotFoundError:
             logger.error(f"Preset file not found during load: {filepath}")
         except json.JSONDecodeError as e:
             logger.error(f"JSONDecodeError loading preset from {filepath}: {e}")
-        except ValueError as e: # Raised by deserializer for bad preset data
-            logger.error(f"ValueError (e.g., invalid preset data format) loading preset from {filepath}: {e}")
+        except ValueError as e:
+            logger.error(f"ValueError loading preset from {filepath}: {e}")
         except Exception as e:
-            logger.error(f"Unexpected error loading preset '{preset_name}' from {filepath}: {e}")
+            logger.error(f"Unexpected error loading preset '{preset_name}' from {filepath}: {e}", exc_info=True)
         
-        return None
+        return []
 
     def get_available_presets(self) -> List[str]:
         """

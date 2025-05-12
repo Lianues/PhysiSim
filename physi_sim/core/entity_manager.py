@@ -1,7 +1,7 @@
-from typing import Type, TypeVar, Optional, Dict, Set, List, Any
+from typing import Type, TypeVar, Optional, Dict, Set, List, Any, Tuple # Added Tuple
 import uuid
 
-from .component import Component # Import the actual Component class
+from .component import Component, ConnectionComponent, ConnectionType # Import the actual Component class, Added ConnectionComponent, ConnectionType
 
 # Define a type variable for Component subtypes
 C = TypeVar('C', bound=Component) # Use the imported Component class
@@ -387,6 +387,44 @@ class EntityManager:
         self.clear_all_independent_components()
         
         print("EntityManager cleared: All entities, components, and independent components removed.")
+
+    def get_revolute_linked_entities(self, start_entity_id: EntityID) -> Set[EntityID]:
+        """
+        Performs a BFS to find all entities connected to start_entity_id through a chain of
+        REVOLUTE_JOINT connections.
+        """
+        if start_entity_id not in self.entities:
+            return set()
+
+        linked_entities: Set[EntityID] = set()
+        queue: List[EntityID] = [start_entity_id]
+        visited: Set[EntityID] = {start_entity_id}
+        
+        head = 0
+        while head < len(queue):
+            current_id = queue[head]
+            head += 1
+            linked_entities.add(current_id)
+
+            # Check all ConnectionComponents involving current_id
+            # This is less efficient than iterating all ConnectionComponents once,
+            # but more targeted for a single BFS traversal.
+            # For higher performance with many calls, pre-indexing connections might be better.
+            
+            all_connections = self.get_all_independent_components_of_type(ConnectionComponent)
+            for conn in all_connections:
+                if conn.connection_type == ConnectionType.REVOLUTE_JOINT and not conn.is_broken:
+                    partner_id: Optional[EntityID] = None
+                    if conn.source_entity_id == current_id:
+                        partner_id = conn.target_entity_id
+                    elif conn.target_entity_id == current_id:
+                        partner_id = conn.source_entity_id
+                    
+                    if partner_id and partner_id not in visited:
+                        visited.add(partner_id)
+                        queue.append(partner_id)
+                        
+        return linked_entities
 
 
 # Example Usage (can be removed or moved to tests)

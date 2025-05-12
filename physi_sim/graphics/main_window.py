@@ -6,10 +6,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QPainter, QColor, QAction, QKeySequence, QMouseEvent, QActionGroup, QPen, QKeyEvent, QWheelEvent, QContextMenuEvent, QGuiApplication # Import QMouseEvent, QActionGroup, QPen, QKeyEvent and QWheelEvent, QContextMenuEvent
 from PySide6.QtCore import Qt, QTimer, Slot, Signal, QPointF, QRectF, QLineF, QEvent # Added QPointF, QRectF, QLineF, QEvent
 from enum import Enum, auto # Added for ToolMode
-
-class ForceAnalysisDisplayMode(Enum):
-    OBJECT = auto()
-    CENTER_OF_MASS = auto()
+from .enums import ToolAttachmentMode, ForceAnalysisDisplayMode # Import from new enums file
 
 from physi_sim.core.component import (
     ScriptExecutionComponent, TransformComponent, GeometryComponent, ShapeType, Component,
@@ -29,6 +26,7 @@ import os # For path manipulation in window title
 import uuid # Added for UUID generation and comparison
 import math # Added for scale bar calculations
 import json # Added for JSONDecodeError
+from physi_sim.core.utils import is_point_inside_polygon # Added for polygon point checking
 
 # Tool Handlers
 from physi_sim.graphics.drawing_tools.base_tool_handler import BaseToolHandler
@@ -44,6 +42,9 @@ from physi_sim.graphics.drawing_tools.force_analysis_tool_handler import ForceAn
 
 # Import PolygonToolHandler
 from physi_sim.graphics.drawing_tools.polygon_tool_handler import PolygonToolHandler
+# from physi_sim.graphics.drawing_tools.axis_tool_handler import AxisToolHandler # REMOVED
+# from physi_sim.graphics.drawing_tools.connect_to_axis_tool_handler import ConnectToAxisToolHandler # REMOVED
+from physi_sim.graphics.drawing_tools.create_revolute_joint_tool_handler import CreateRevoluteJointToolHandler # ADDED
 
 # UI Handlers
 from physi_sim.graphics.ui_handlers.scene_file_handler import SceneFileHandler
@@ -62,10 +63,11 @@ class ToolMode(Enum):
     FORCE_ANALYSIS = auto() # 新增：受力分析工具
     PAN_VIEW = auto() # 新增：平移视图工具
     POLYGON_DRAW = auto() # 新增：多边形绘制工具
+    # PLACE_AXIS = auto() # REMOVED
+    # CONNECT_TO_AXIS = auto() # REMOVED
+    CREATE_REVOLUTE_JOINT = auto() # ADDED: Tool to create a revolute joint between two dynamic bodies
 
-class ToolAttachmentMode(Enum):
-    CENTER_OF_MASS = auto()
-    FREE_POSITION = auto()
+# ToolAttachmentMode and ForceAnalysisDisplayMode are now imported from .enums
 
 # 一个简单的自定义QWidget用于绘图
 class DrawingWidget(QWidget):
@@ -120,7 +122,10 @@ class DrawingWidget(QWidget):
             ToolMode.APPLY_FORCE_AT_POINT: ApplyForceToolHandler(), # Reverted: Does not take entity_manager
             ToolMode.PAN_VIEW: PanViewToolHandler(),
             ToolMode.FORCE_ANALYSIS: ForceAnalysisToolHandler(),
-            ToolMode.POLYGON_DRAW: PolygonToolHandler(em_for_handlers) # PolygonToolHandler expects entity_manager
+            ToolMode.POLYGON_DRAW: PolygonToolHandler(em_for_handlers),
+            # ToolMode.PLACE_AXIS: AxisToolHandler(em_for_handlers), # REMOVED
+            # ToolMode.CONNECT_TO_AXIS: ConnectToAxisToolHandler(em_for_handlers), # REMOVED
+            ToolMode.CREATE_REVOLUTE_JOINT: CreateRevoluteJointToolHandler(em_for_handlers) # ADDED
         }
         # Note: ENTITY_DRAG is part of SELECT tool's logic
         
@@ -267,18 +272,20 @@ class DrawingWidget(QWidget):
 
         # --- Snap Points (still drawn by DrawingWidget as it's a shared visual feedback) ---
         if isinstance(main_window, MainWindow):
-            connection_tools = [ToolMode.DRAW_SPRING, ToolMode.DRAW_ROD, ToolMode.DRAW_ROPE]
+            connection_tools = [
+                ToolMode.DRAW_SPRING,
+                ToolMode.DRAW_ROD,
+                ToolMode.DRAW_ROPE,
+                # ToolMode.CONNECT_TO_AXIS, # REMOVED
+                ToolMode.CREATE_REVOLUTE_JOINT # ADDED
+            ]
+            # is_connect_to_axis_active_direct_check = (main_window.current_tool_mode == ToolMode.CONNECT_TO_AXIS) # REMOVED
             is_connection_tool_active = main_window.current_tool_mode in connection_tools
-
-            # Debug print for the conditions
-            # print(f"PaintEvent DBG: is_conn_tool_active={is_connection_tool_active}, self.is_snap_active={self.is_snap_active}, self.current_mouse_world_pos={self.current_mouse_world_pos is not None}")
-
+            
             if is_connection_tool_active and self.is_snap_active and self.current_mouse_world_pos:
-                # print(f"PaintEvent: Checking snap points. Mouse world: {self.current_mouse_world_pos}, Snap Active: {self.is_snap_active}")
                 entity_under_mouse_id = main_window._get_entity_at_world_pos(self.current_mouse_world_pos)
                 
                 if entity_under_mouse_id:
-                    # print(f"PaintEvent: Entity under mouse for snap points: {str(entity_under_mouse_id)[:8]}")
                     entity_geom = main_window.entity_manager.get_component(entity_under_mouse_id, GeometryComponent)
                     entity_transform = main_window.entity_manager.get_component(entity_under_mouse_id, TransformComponent)
 
@@ -297,8 +304,6 @@ class DrawingWidget(QWidget):
                             world_snap_point = entity_transform.position + local_point.rotate(entity_transform.angle)
                             painter.drawEllipse(QPointF(world_snap_point.x, world_snap_point.y),
                                                 snap_radius_world, snap_radius_world)
-                # else:
-                    # print(f"PaintEvent: No entity under mouse for snap points.")
 
 
         painter.restore() # Restore from main view transform (translate and scale)
@@ -578,49 +583,48 @@ class DrawingWidget(QWidget):
 
         world_pos = self._get_world_coordinates(event.pos())
         
-        # Check if the click is on a selected entity or connection
         entity_id_under_mouse = main_window._get_entity_at_world_pos(world_pos)
-        connection_id_under_mouse = main_window._get_connection_at_world_pos(world_pos) # Requires implementation
+        connection_id_under_mouse = main_window._get_connection_at_world_pos(world_pos)
 
-        item_to_operate_on_id = None
-        item_type = None # "ENTITY" or "CONNECTION"
+        menu_created = False
+        menu = QMenu(self)
 
         if entity_id_under_mouse and entity_id_under_mouse in main_window.selected_entity_ids:
-            item_to_operate_on_id = entity_id_under_mouse
-            item_type = "ENTITY"
-        elif connection_id_under_mouse and connection_id_under_mouse in main_window.selected_connection_ids:
-            item_to_operate_on_id = connection_id_under_mouse
-            item_type = "CONNECTION"
+            # 操作选中的实体
+            properties_action = QAction("属性", self)
+            properties_action.triggered.connect(
+                lambda checked=False, entity_id=entity_id_under_mouse:
+                    main_window._handle_show_properties_for_entity(entity_id)
+            )
+            menu.addAction(properties_action)
 
-        if item_to_operate_on_id:
-            menu = QMenu(self)
-            
             delete_action = QAction("删除", self)
             delete_action.triggered.connect(main_window._handle_delete_selected_objects)
             menu.addAction(delete_action)
+            menu_created = True
 
-            if item_type == "ENTITY":
-                # Optionally, add "Properties" action if it's an entity
-                properties_action = QAction("属性", self)
-                # Assuming _handle_selection_change_for_property_panel can be triggered or adapted
-                # to show properties for a specific entity if it's not already selected.
-                # For simplicity, we'll assume if it's right-clicked and selected, its props might already be shown
-                # or this action could force it.
-                # This part might need more complex logic to ensure the property panel updates correctly
-                # if the right-clicked entity wasn't the *only* selected one.
-                # For now, let's make it re-assert selection for the property panel,
-                # and then explicitly show and position the panel.
-                properties_action.triggered.connect(
-                    lambda checked=False, entity_id=item_to_operate_on_id:
-                        main_window._handle_show_properties_for_entity(entity_id)
-                )
-                menu.addAction(properties_action)
-            
+        elif connection_id_under_mouse and connection_id_under_mouse in main_window.selected_connection_ids:
+            # 操作选中的连接器
+            properties_action = QAction("属性", self)
+            # 当属性动作触发时，调用 display_properties_for_selection 并显示/定位面板
+            properties_action.triggered.connect(
+                lambda checked=False, conn_id=connection_id_under_mouse:
+                    (
+                        main_window.property_panel.update_properties(set(), {conn_id}),
+                        main_window._show_and_position_property_panel() # 确保面板显示
+                    )
+            )
+            menu.addAction(properties_action)
+
+            delete_action = QAction("删除", self)
+            delete_action.triggered.connect(main_window._handle_delete_selected_objects)
+            menu.addAction(delete_action)
+            menu_created = True
+
+        if menu_created:
             menu.exec(event.globalPos())
         else:
-            # Standard context menu or no menu if click is not on a selected item
-            # For now, just pass to super if no relevant item is clicked.
-            # Later, a general canvas context menu could be added here.
+            # 如果没有在选中的对象上点击，则不显示菜单或显示默认菜单
             super().contextMenuEvent(event)
 
 
@@ -662,7 +666,13 @@ class DrawingWidget(QWidget):
 
         # --- Shift Key Handling for Snap Mode ---
         is_connection_tool_active = False
-        connection_tools = [ToolMode.DRAW_SPRING, ToolMode.DRAW_ROD, ToolMode.DRAW_ROPE]
+        connection_tools = [
+            ToolMode.DRAW_SPRING,
+            ToolMode.DRAW_ROD,
+            ToolMode.DRAW_ROPE,
+            # ToolMode.CONNECT_TO_AXIS, # REMOVED
+            ToolMode.CREATE_REVOLUTE_JOINT # ADDED
+        ]
         if main_window.current_tool_mode in connection_tools:
             is_connection_tool_active = True
 
@@ -739,7 +749,13 @@ class DrawingWidget(QWidget):
         # This logic specifically handles the release of the Shift key.
         if key == Qt.Key.Key_Shift and not event.isAutoRepeat():
             is_connection_tool_active = False
-            connection_tools = [ToolMode.DRAW_SPRING, ToolMode.DRAW_ROD, ToolMode.DRAW_ROPE]
+            connection_tools = [
+                ToolMode.DRAW_SPRING,
+                ToolMode.DRAW_ROD,
+                ToolMode.DRAW_ROPE,
+                # ToolMode.CONNECT_TO_AXIS, # REMOVED
+                ToolMode.CREATE_REVOLUTE_JOINT # ADDED
+            ]
             if main_window.current_tool_mode in connection_tools:
                 is_connection_tool_active = True
             
@@ -772,26 +788,26 @@ class PhysicsSettingsDialog(QDialog):
         layout = QVBoxLayout(self)
         form_layout = QFormLayout()
 
-        self.alpha_spinbox = QDoubleSpinBox()
-        self.beta_spinbox = QDoubleSpinBox()
+        self.pos_factor_spinbox = QDoubleSpinBox()
+        self.vel_factor_spinbox = QDoubleSpinBox()
 
         if self.constraint_solver:
-            self.alpha_spinbox.setDecimals(2)
-            self.alpha_spinbox.setRange(0.0, 10000.0)
-            self.alpha_spinbox.setSingleStep(0.5)
-            self.alpha_spinbox.setValue(getattr(self.constraint_solver, 'baumgarte_alpha', 5.0))
-            form_layout.addRow("Baumgarte Alpha:", self.alpha_spinbox)
+            self.pos_factor_spinbox.setDecimals(2)
+            self.pos_factor_spinbox.setRange(0.01, 5.0) # Range for dimensionless factor
+            self.pos_factor_spinbox.setSingleStep(0.05)
+            self.pos_factor_spinbox.setValue(getattr(self.constraint_solver, 'baumgarte_pos_correction_factor', 0.2))
+            form_layout.addRow("Baumgarte 位置校正因子:", self.pos_factor_spinbox)
 
-            self.beta_spinbox.setDecimals(2)
-            self.beta_spinbox.setRange(0.0, 10000.0)
-            self.beta_spinbox.setSingleStep(0.5)
-            self.beta_spinbox.setValue(getattr(self.constraint_solver, 'baumgarte_beta', 0.5))
-            form_layout.addRow("Baumgarte Beta:", self.beta_spinbox)
+            self.vel_factor_spinbox.setDecimals(2)
+            self.vel_factor_spinbox.setRange(0.0, 5.0) # Range for dimensionless factor
+            self.vel_factor_spinbox.setSingleStep(0.05)
+            self.vel_factor_spinbox.setValue(getattr(self.constraint_solver, 'baumgarte_vel_correction_factor', 0.8))
+            form_layout.addRow("Baumgarte 速度校正因子:", self.vel_factor_spinbox)
         else:
             error_label = QLabel("约束求解器不可用。")
             form_layout.addRow(error_label)
-            self.alpha_spinbox.setEnabled(False)
-            self.beta_spinbox.setEnabled(False)
+            self.pos_factor_spinbox.setEnabled(False)
+            self.vel_factor_spinbox.setEnabled(False)
             
         layout.addLayout(form_layout)
 
@@ -802,11 +818,11 @@ class PhysicsSettingsDialog(QDialog):
 
     def accept(self):
         if self.constraint_solver:
-            if hasattr(self.constraint_solver, 'baumgarte_alpha'):
-                self.constraint_solver.baumgarte_alpha = self.alpha_spinbox.value()
-            if hasattr(self.constraint_solver, 'baumgarte_beta'):
-                self.constraint_solver.baumgarte_beta = self.beta_spinbox.value()
-            print(f"Physics settings updated: Alpha={self.constraint_solver.baumgarte_alpha}, Beta={self.constraint_solver.baumgarte_beta}")
+            if hasattr(self.constraint_solver, 'baumgarte_pos_correction_factor'):
+                self.constraint_solver.baumgarte_pos_correction_factor = self.pos_factor_spinbox.value()
+            if hasattr(self.constraint_solver, 'baumgarte_vel_correction_factor'):
+                self.constraint_solver.baumgarte_vel_correction_factor = self.vel_factor_spinbox.value()
+            print(f"Physics settings updated: Pos Factor={self.constraint_solver.baumgarte_pos_correction_factor}, Vel Factor={self.constraint_solver.baumgarte_vel_correction_factor}")
         super().accept()
 
 
@@ -841,6 +857,7 @@ class MainWindow(QMainWindow):
         # self.rod_attachment_mode: ToolAttachmentMode = ToolAttachmentMode.CENTER_OF_MASS # Removed
         # self.rope_attachment_mode: ToolAttachmentMode = ToolAttachmentMode.CENTER_OF_MASS # Removed
         self.force_application_mode: ToolAttachmentMode = ToolAttachmentMode.CENTER_OF_MASS # Keep for force tool
+        # self.axis_attachment_mode was removed as axis entities are removed.
 
         # Force Analysis State
         self.force_analysis_target_entity_id: Optional[uuid.UUID] = None
@@ -1143,6 +1160,9 @@ class MainWindow(QMainWindow):
         if changed:
             print("选择已清除。")
             self.selection_changed.emit(self._selected_entity_ids, self._selected_connection_ids)
+            # Update "Save Selection as Preset" action enabled state
+            if hasattr(self, 'save_selection_as_preset_action'):
+                self.save_selection_as_preset_action.setEnabled(False)
             self.drawing_widget.update()
 
     def set_single_selected_object(self, obj_type: Optional[str], obj_id: Optional[uuid.UUID]):
@@ -1160,6 +1180,9 @@ class MainWindow(QMainWindow):
         
         print(f"单一选择已设置: 实体={self._selected_entity_ids}, 连接={self._selected_connection_ids}")
         self.selection_changed.emit(self._selected_entity_ids, self._selected_connection_ids)
+        # Update "Save Selection as Preset" action enabled state
+        if hasattr(self, 'save_selection_as_preset_action'):
+            self.save_selection_as_preset_action.setEnabled(bool(self._selected_entity_ids or self._selected_connection_ids))
         self.drawing_widget.update()
 
     def set_marquee_selection(self, entity_ids: Set[uuid.UUID], connection_ids: Set[uuid.UUID]):
@@ -1169,6 +1192,9 @@ class MainWindow(QMainWindow):
         
         print(f"框选结果: {len(entity_ids)} 个实体, {len(connection_ids)} 个连接。")
         self.selection_changed.emit(self._selected_entity_ids, self._selected_connection_ids)
+        # Update "Save Selection as Preset" action enabled state
+        if hasattr(self, 'save_selection_as_preset_action'):
+            self.save_selection_as_preset_action.setEnabled(bool(self._selected_entity_ids or self._selected_connection_ids))
         self.drawing_widget.update()
 
     def _select_by_type(self, item_type: Union[ShapeType, str]):
@@ -1203,9 +1229,15 @@ class MainWindow(QMainWindow):
         if newly_selected_entities or newly_selected_connections:
             print(f"按类型选择: {item_type} - {len(newly_selected_entities)} 个实体, {len(newly_selected_connections)} 个连接")
             self.selection_changed.emit(self._selected_entity_ids, self._selected_connection_ids)
+            # Update "Save Selection as Preset" action enabled state
+            if hasattr(self, 'save_selection_as_preset_action'):
+                self.save_selection_as_preset_action.setEnabled(True)
             self.drawing_widget.update()
         else:
             self.status_bar.showMessage(f"场景中没有找到类型为 '{item_type}' 的对象。", 2000)
+            if hasattr(self, 'save_selection_as_preset_action'):
+                self.save_selection_as_preset_action.setEnabled(False)
+
 
     def _update_window_title(self):
         if self.scene_manager.current_scene_filepath:
@@ -1252,9 +1284,10 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
 
         # --- 预设相关操作 ---
-        save_preset_action = QAction("将选中实体另存为预设(&V)...", self)
-        save_preset_action.triggered.connect(self._save_selected_entity_as_preset)
-        file_menu.addAction(save_preset_action)
+        self.save_selection_as_preset_action = QAction("将选中对象另存为预设(&V)...", self)
+        self.save_selection_as_preset_action.triggered.connect(self._save_selection_as_preset)
+        self.save_selection_as_preset_action.setEnabled(False) # Initially disabled
+        file_menu.addAction(self.save_selection_as_preset_action)
         
         file_menu.addSeparator()
         
@@ -1424,9 +1457,18 @@ class MainWindow(QMainWindow):
         toolbar.addAction(draw_rope_action)
         self.drawing_tool_group.addAction(draw_rope_action)
 
-        toolbar.addSeparator() # Separator after drawing tools
+        toolbar.addSeparator()
 
-        apply_force_action = QAction("施加力", self) # 新增：施加力按钮
+        # --- Revolute Joint Tool ---
+        create_revolute_joint_action = QAction("创建转动关节", self)
+        create_revolute_joint_action.setCheckable(True)
+        create_revolute_joint_action.triggered.connect(lambda: self._set_tool_mode(ToolMode.CREATE_REVOLUTE_JOINT))
+        toolbar.addAction(create_revolute_joint_action)
+        self.drawing_tool_group.addAction(create_revolute_joint_action)
+        
+        toolbar.addSeparator() # Separator after joint tools
+
+        apply_force_action = QAction("施加力", self)
         apply_force_action.setCheckable(True)
         apply_force_action.triggered.connect(lambda: self._set_tool_mode(ToolMode.APPLY_FORCE_AT_POINT))
 
@@ -1525,35 +1567,44 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage(f"施力工具模式: {mode.name}", 2000)
         # Similar to above, QActionGroup should handle the visual check state.
 
+    # Removed _set_axis_attachment_mode method as it's no longer needed.
+
     def _exit_app(self):
         # TODO: Add check for unsaved changes before exiting
         QApplication.instance().quit()
 
-    def _save_selected_entity_as_preset(self):
-        # This method involves UI (QInputDialog) and scene_manager logic.
-        # It could be part of a hypothetical "PresetHandler" or stay in MainWindow
-        # if it's considered a core MainWindow action. For now, keep here.
-        if not self._selected_entity_ids: # Check if the set is empty
-            QMessageBox.warning(self, "保存预设失败", "没有选中的实体。请先在场景中选择一个实体。")
+    def _save_selection_as_preset(self):
+        if not self.selected_entity_ids and not self.selected_connection_ids:
+            QMessageBox.warning(self, "保存预设失败", "没有选中的对象（实体或连接器）。")
             return
-        
-        # Assuming we save the first selected entity if multiple are selected.
-        # Or, disable if more than one entity is selected.
-        if len(self._selected_entity_ids) > 1:
-            QMessageBox.warning(self, "保存预设失败", "请只选择一个实体以保存为预设。")
-            return
-            
-        selected_entity_id_to_save = list(self._selected_entity_ids)[0]
 
-        preset_name, ok = QInputDialog.getText(self, "保存预设", "请输入预设名称:")
+        # At least one entity must be selected to define an anchor for the group.
+        if not self.selected_entity_ids:
+            QMessageBox.warning(self, "保存预设失败", "必须至少选择一个实体来创建组合预设。")
+            return
+
+        preset_name, ok = QInputDialog.getText(self, "保存组合预设", "请输入预设名称:")
         if ok and preset_name:
+            # Convert sets to lists for the scene_manager method
+            entity_ids_list = list(self.selected_entity_ids)
+            connection_ids_list = list(self.selected_connection_ids)
+            
             try:
-                self.scene_manager.save_entity_as_preset(selected_entity_id_to_save, preset_name)
-                QMessageBox.information(self, "保存成功", f"实体已保存为预设 '{preset_name}'.")
-                if hasattr(self, 'create_from_preset_menu'):
-                    self._populate_create_from_preset_menu(self.create_from_preset_menu)
+                # Call the updated method in SceneManager
+                success = self.scene_manager.save_selection_as_preset(
+                    preset_name,
+                    entity_ids_list,
+                    connection_ids_list
+                )
+                if success:
+                    QMessageBox.information(self, "保存成功", f"选中的对象已保存为组合预设 '{preset_name}'.")
+                    if hasattr(self, 'create_from_preset_menu'):
+                        self._populate_create_from_preset_menu(self.create_from_preset_menu)
+                else:
+                    # SceneManager logs specific errors, so a generic message here is okay.
+                    QMessageBox.critical(self, "保存预设失败", f"无法保存组合预设 '{preset_name}'. 请查看日志获取详情。")
             except Exception as e:
-                QMessageBox.critical(self, "保存预设失败", f"无法保存预设: {e}")
+                QMessageBox.critical(self, "保存预设时发生错误", f"保存组合预设 '{preset_name}' 时发生意外错误: {e}")
         elif ok and not preset_name:
             QMessageBox.warning(self, "无效名称", "预设名称不能为空。")
 
@@ -1591,16 +1642,22 @@ class MainWindow(QMainWindow):
             pos_y = float(y_str)
             target_position = Vector2D(pos_x, pos_y)
             
-            new_entity_id = self.scene_manager.load_preset_to_scene(preset_name, target_position)
-            if new_entity_id is not None:
-                QMessageBox.information(self, "加载成功", f"预设 '{preset_name}' 已加载到场景中。")
+            # Call the updated load_preset method
+            created_entity_ids = self.scene_manager.load_preset(preset_name, target_position)
+            if created_entity_ids: # Check if the list is not empty
+                QMessageBox.information(self, "加载成功", f"预设 '{preset_name}' 已成功加载 ({len(created_entity_ids)} 个实体已创建)。")
                 self.drawing_widget.update()
+                # Optionally, select the newly created entities
+                self.clear_selection()
+                self._selected_entity_ids.update(created_entity_ids)
+                self.selection_changed.emit(self._selected_entity_ids, self._selected_connection_ids)
+
             else:
-                QMessageBox.warning(self, "加载预设", f"预设 '{preset_name}' 加载失败或未返回实体ID。")
+                QMessageBox.warning(self, "加载预设", f"预设 '{preset_name}' 加载失败或未创建任何实体。")
         except ValueError:
             QMessageBox.critical(self, "输入错误", "无效的坐标值。")
         except Exception as e:
-            QMessageBox.critical(self, "加载预设失败", f"无法加载预设 '{preset_name}': {e}")
+            QMessageBox.critical(self, "加载预设失败", f"无法加载预设 '{preset_name}': {e}", exc_info=True)
 
     def _get_entity_at_world_pos(self, world_pos: Vector2D) -> Optional[uuid.UUID]:
         """Helper to find an entity at a given world position."""
@@ -1639,6 +1696,17 @@ class MainWindow(QMainWindow):
                     # This check MUST be inside the CIRCLE block
                     if (world_pos.x - center.x)**2 + (world_pos.y - center.y)**2 <= radius**2:
                         # print(f"    HIT on CIRCLE: {str(entity_id_candidate)[:8]}")
+                        return entity_id_candidate
+                elif geometry.shape_type == ShapeType.POLYGON:
+                    local_vertices = geometry.parameters.get("vertices", [])
+                    if not local_vertices or len(local_vertices) < 3:
+                        continue # Not a valid polygon for hit-testing
+
+                    # Transform local vertices to world coordinates
+                    world_vertices = [transform.position + lv.rotate(transform.angle) for lv in local_vertices]
+                    
+                    if is_point_inside_polygon(world_pos, world_vertices):
+                        # print(f"    HIT on POLYGON: {str(entity_id_candidate)[:8]}")
                         return entity_id_candidate
         # print(f"  No entity found at {world_pos}")
         return None
@@ -1868,9 +1936,10 @@ class MainWindow(QMainWindow):
         Can be called with render=False for fast-forwarding.
         """
         # --- Physics Update ---
-        # Force accumulators should NOT be cleared before this section,
-        # so that forces from tools (like ApplyForce) are included.
-        # 1. Apply all force-generating systems (including gravity)
+        # Order of operations is crucial here.
+
+        # 1. Apply external forces (gravity, springs, user-applied forces via tools)
+        # These are added to ForceAccumulators.
         if self.physics_system and self.physics_system.gravity_enabled and self.entity_manager:
             for entity_id_grav in self.entity_manager.get_entities_with_components(PhysicsBodyComponent, ForceAccumulatorComponent):
                 phys_body_grav = self.entity_manager.get_component(entity_id_grav, PhysicsBodyComponent)
@@ -1885,21 +1954,35 @@ class MainWindow(QMainWindow):
                     )
         
         if self.spring_system:
-            self.spring_system.update(self.dt) # Spring system adds forces
-        # if self.rod_system: # Removed
-        #     self.rod_system.update(self.dt) # Rod system adds forces # Removed
+            self.spring_system.update(self.dt) # Spring system adds forces to accumulators
 
-        if self.collision_system:
-            self.collision_system.update(self.dt) # Collision system might add forces (e.g., contact forces) or resolve penetrations
-
-        # 2. Perform initial physics integration (prediction step)
-        # This updates positions and velocities based on all accumulated forces so far.
-        # It also sets physics_body.previous_acceleration based on the current net_force.
+        # 2. Apply constraint forces (e.g., from ropes, revolute joints)
+        # This will call ConstraintSolverSystem, which now adds constraint forces to ForceAccumulators.
         if self.physics_system:
-            self.physics_system.update(self.dt)
+            # This new method calls constraint_solver.solve_constraints_and_get_accelerations
+            # which has been modified to add constraint forces to ForceAccumulators.
+            # We call it here primarily for its side effect on ForceAccumulators.
+            self.physics_system.update_constraints_and_apply_forces(self.dt)
 
-        # 3. Store predicted state for PBD
-        # These are the positions/angles *after* force integration but *before* PBD constraint solving.
+        # 3. Collision detection and response (including contact forces)
+        # ForceCalculator (inside CollisionSystem) will now see net_force including external and constraint forces.
+        # Contact forces (support, friction) will be added to ForceAccumulators by ForceCalculator.
+        if self.collision_system:
+            self.collision_system.update(self.dt)
+
+        # 4. Final physics integration
+        # This will use the fully populated ForceAccumulators (external + constraint + contact forces)
+        # to determine final accelerations and integrate the physics state.
+        if self.physics_system:
+            # This new method will:
+            # - Collect all forces from ForceAccumulators.
+            # - Call ConstraintSolverSystem again to get final accelerations based on *all* forces.
+            # - Perform the integration (update position, velocity, previous_acceleration).
+            self.physics_system.update_integrate_state(self.dt)
+
+        # PBD (Position Based Dynamics) step - currently commented out in original code
+        # If re-enabled, its placement would need careful consideration relative to the new flow.
+        # For now, we follow the existing commented-out structure.
         positions_after_physics_integration: Dict[uuid.UUID, Vector2D] = {}
         angles_after_physics_integration: Dict[uuid.UUID, float] = {}
         if self.entity_manager:
@@ -2020,8 +2103,6 @@ class MainWindow(QMainWindow):
             # Logging for all non-fixed physics bodies to see their state at step start
             for eid_debug in self.entity_manager.get_entities_with_components(PhysicsBodyComponent):
                 pb_debug = self.entity_manager.get_component(eid_debug, PhysicsBodyComponent)
-                if pb_debug and not pb_debug.is_fixed:
-                    print(f"[DEBUG_MAIN_SIM_STEP_START] Entity {str(eid_debug)[:8]} - Velocity at start of step: {pb_debug.velocity}, PrevAccel: {pb_debug.previous_acceleration}")
 
         # Perform the actual simulation physics, scripting, etc.
         # The core step now increments time and can optionally render/update display.

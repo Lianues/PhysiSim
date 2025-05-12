@@ -20,16 +20,135 @@ class PhysicsSystem(System):
         super().__init__(entity_manager)
         self.gravity = gravity
         self.gravity_enabled = True # Default to enabled
-        # Initialize the ConstraintSolverSystem
-        # TODO: Consider making baumgarte_alpha and baumgarte_beta configurable
-        self.constraint_solver = ConstraintSolverSystem(entity_manager, baumgarte_alpha=5.0, baumgarte_beta=0.5)
+        # Initialize the ConstraintSolverSystem with new factor-based Baumgarte parameters
+        # These factors are dimensionless. Effective alpha/beta will be calculated using dt in the solver.
+        # Defaults based on common practice (e.g., Box2D's Baumgarte factor is around 0.2 for position)
+        # Increasing these factors for potentially "stiffer" constraints as per user feedback.
+        baumgarte_pos_factor = 0.8  # Increased from 0.2
+        baumgarte_vel_factor = 1.0  # Increased from 0.8
+                                    # ConstraintSolverSystem will calculate effective_alpha = pos_factor/dt
+                                    # and effective_beta = vel_factor/dt.
+        self.constraint_solver = ConstraintSolverSystem(
+            entity_manager,
+            baumgarte_pos_correction_factor=baumgarte_pos_factor,
+            baumgarte_vel_correction_factor=baumgarte_vel_factor
+        )
+        print(f"PhysicsSystem: ConstraintSolver initialized with Baumgarte factors: pos_factor={baumgarte_pos_factor}, vel_factor={baumgarte_vel_factor}")
 
+
+    def _collect_external_forces_and_ids(self) -> Tuple[List[uuid.UUID], Dict[uuid.UUID, Tuple[Vector2D, float]]]:
+        """Helper to collect external forces and list of physics entity IDs."""
+        entities_with_physics = self.entity_manager.get_entities_with_components(
+            TransformComponent, PhysicsBodyComponent, ForceAccumulatorComponent
+        )
+        external_forces_torques_map: Dict[uuid.UUID, Tuple[Vector2D, float]] = {}
+        all_entity_ids_with_physics_list: List[uuid.UUID] = []
+
+        for entity_id in entities_with_physics:
+            all_entity_ids_with_physics_list.append(entity_id)
+            force_accumulator = self.entity_manager.get_component(entity_id, ForceAccumulatorComponent)
+            if force_accumulator:
+                external_forces_torques_map[entity_id] = (
+                    force_accumulator.net_force,
+                    force_accumulator.net_torque
+                )
+            else:
+                external_forces_torques_map[entity_id] = (Vector2D(0, 0), 0.0)
+        return all_entity_ids_with_physics_list, external_forces_torques_map
+
+    def update_constraints_and_apply_forces(self, dt: float) -> None:
+        """
+        Solves constraints and applies the resulting constraint forces to ForceAccumulators.
+        This step is intended to run BEFORE collision detection and response.
+        """
+        all_entity_ids_list, external_forces_map = self._collect_external_forces_and_ids()
+
+        if not all_entity_ids_list:
+            return
+
+        # This call will now internally add constraint forces to ForceAccumulators
+        # We ignore the returned accelerations here as we only care about the force application side effect.
+        _ = self.constraint_solver.solve_constraints_and_get_accelerations(
+            dt,
+            all_entity_ids_list,
+            external_forces_map
+        )
+        # print(f"DEBUG_PHYSYS_CONSTRAINTS_APPLIED: Constraint forces applied to accumulators.")
+
+    def update_integrate_state(self, dt: float) -> None:
+        """
+        Performs the final physics integration step using all accumulated forces
+        (external, constraint, contact).
+        This step is intended to run AFTER collision detection and response.
+        """
+        all_entity_ids_list, external_forces_map_final = self._collect_external_forces_and_ids()
+        
+        if not all_entity_ids_list:
+            return
+
+        # Get final constrained accelerations based on ALL forces (external, constraint, contact)
+        # For this call, we do NOT want to re-apply or re-record constraint forces,
+        # as they should have been handled by update_constraints_and_apply_forces().
+        # We only need the resulting accelerations for integration.
+        constrained_accel_map_final = self.constraint_solver.solve_constraints_and_get_accelerations(
+            dt,
+            all_entity_ids_list,
+            external_forces_map_final, # This map now contains all forces
+            apply_and_record_constraint_forces=False # Pass False here
+        )
+        
+        # Integrate physics state using these final accelerations
+        for entity_id in all_entity_ids_list: # Iterate using the list that was used for map creation
+            transform = self.entity_manager.get_component(entity_id, TransformComponent)
+            physics_body = self.entity_manager.get_component(entity_id, PhysicsBodyComponent)
+
+            if not (transform and physics_body):
+                print(f"Warning: Entity {entity_id} missing Transform or PhysicsBody during final integration. Skipping.")
+                continue
+
+            if physics_body.is_fixed:
+                physics_body.velocity = Vector2D(0, 0)
+                physics_body.angular_velocity = 0.0
+                physics_body.previous_acceleration = Vector2D(0, 0)
+                continue
+
+            v_old_linear = physics_body.velocity
+            a_old_linear = physics_body.previous_acceleration
+
+            transform.position = transform.position + (v_old_linear * dt) + (a_old_linear * (0.5 * dt * dt))
+
+            accel_data = constrained_accel_map_final.get(entity_id)
+            if accel_data:
+                a_new_linear, a_new_angular = accel_data
+            else:
+                # Fallback if entity somehow missed in final accel map (should not happen)
+                print(f"Warning: Entity {entity_id} not found in final constrained_accel_map. Using its current net_force/M.")
+                current_force_acc = self.entity_manager.get_component(entity_id, ForceAccumulatorComponent)
+                if current_force_acc:
+                     ext_force_final, ext_torque_final = current_force_acc.net_force, current_force_acc.net_torque
+                else: # Should definitely not happen if it's in all_entity_ids_list
+                     ext_force_final, ext_torque_final = Vector2D(0,0), 0.0
+
+                a_new_linear = ext_force_final / physics_body.mass if physics_body.mass > EPSILON else Vector2D(0, 0)
+                a_new_angular = ext_torque_final / physics_body.moment_of_inertia if physics_body.moment_of_inertia > EPSILON else 0.0
+
+
+            physics_body.velocity = v_old_linear + (a_old_linear + a_new_linear) * (0.5 * dt)
+            physics_body.previous_acceleration = a_new_linear
+
+            if physics_body.moment_of_inertia > EPSILON:
+                physics_body.angular_velocity += a_new_angular * dt
+                transform.angle += physics_body.angular_velocity * dt
+                transform.angle = (transform.angle + math.pi) % (2 * math.pi) - math.pi
+            else:
+                transform.angle += physics_body.angular_velocity * dt
+                transform.angle = (transform.angle + math.pi) % (2 * math.pi) - math.pi
 
     def toggle_gravity(self, enabled: bool) -> None:
         """Enables or disables gravity for the system."""
         self.gravity_enabled = enabled
 
-    def update(self, dt: float) -> None:
+    def update(self, dt: float) -> None: # Original update method
         # Get all entities that have physics properties
         entities_with_physics = self.entity_manager.get_entities_with_components(
             TransformComponent, PhysicsBodyComponent, ForceAccumulatorComponent
@@ -63,7 +182,7 @@ class PhysicsSystem(System):
             all_entity_ids_with_physics_list, # Pass all relevant entity IDs
             external_forces_torques_map
         )
-        # print(f"[DEBUG_PHYSYS] Constrained Accel Map: {constrained_accel_map}")
+        # # print(f"[DEBUG_PHYSYS] Constrained Accel Map: {constrained_accel_map}")
 
 
         # 3. Integrate physics state using constrained accelerations
@@ -101,7 +220,7 @@ class PhysicsSystem(System):
             accel_data = constrained_accel_map.get(entity_id)
             if accel_data:
                 a_new_linear, a_new_angular = accel_data
-                # print(f"[DEBUG_PHYSYS_INTEGRATE] Entity {str(entity_id)[:8]}: Constrained a_new_linear={a_new_linear}, a_new_angular={a_new_angular:.4f}")
+                # # print(f"[DEBUG_PHYSYS_INTEGRATE] Entity {str(entity_id)[:8]}: Constrained a_new_linear={a_new_linear}, a_new_angular={a_new_angular:.4f}")
             else:
                 # This case should ideally be covered by constraint_solver returning accelerations
                 # for all entities passed to it (either constrained or unconstrained based on F_ext).
@@ -134,7 +253,7 @@ class PhysicsSystem(System):
                 transform.angle += physics_body.angular_velocity * dt # Still apply existing ang_vel
                 transform.angle = (transform.angle + math.pi) % (2 * math.pi) - math.pi
 
-            # print(f"[DEBUG_PHYSYS_OUTPUT] Entity {str(entity_id)[:8]}: pos={transform.position}, vel={physics_body.velocity}, angle={transform.angle:.2f}, ang_vel={physics_body.angular_velocity:.2f}, prev_accel={physics_body.previous_acceleration}")
+            # # print(f"[DEBUG_PHYSYS_OUTPUT] Entity {str(entity_id)[:8]}: pos={transform.position}, vel={physics_body.velocity}, angle={transform.angle:.2f}, ang_vel={physics_body.angular_velocity:.2f}, prev_accel={physics_body.previous_acceleration}")
 
         # ForceAccumulators are cleared by the main simulation loop after all systems that might read them
         # (like rendering detailed forces) have run.
@@ -159,7 +278,7 @@ class PhysicsSystem(System):
 
         if mass <= 0: # Fixed objects or zero mass objects have infinite inertia effectively
             physics_body.moment_of_inertia = float('inf')
-            # print(f"Entity {entity_id} has mass <= 0, setting inertia to infinity.")
+            # # print(f"Entity {entity_id} has mass <= 0, setting inertia to infinity.")
             return
 
         if geometry.shape_type == ShapeType.RECTANGLE:
@@ -222,4 +341,4 @@ class PhysicsSystem(System):
         else:
             physics_body.moment_of_inertia = new_inertia
         
-        # print(f"Calculated and set inertia for entity {entity_id}: {physics_body.moment_of_inertia:.4f} (Mass: {mass}, Shape: {geometry.shape_type})")
+        # # print(f"Calculated and set inertia for entity {entity_id}: {physics_body.moment_of_inertia:.4f} (Mass: {mass}, Shape: {geometry.shape_type})")

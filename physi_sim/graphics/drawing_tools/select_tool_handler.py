@@ -3,11 +3,11 @@ from PySide6.QtGui import QPainter, QColor, QPen, QCursor
 
 from physi_sim.graphics.drawing_tools.base_tool_handler import BaseToolHandler
 from physi_sim.core.vector import Vector2D
-from physi_sim.core.component import SpringComponent, ConnectionComponent, TransformComponent, GeometryComponent, ShapeType, ConnectionType # Use ConnectionType Enum
-from physi_sim.core.entity_manager import EntityManager # For type hinting if needed
+from physi_sim.core.component import SpringComponent, ConnectionComponent, TransformComponent, GeometryComponent, ShapeType, ConnectionType, IdentifierComponent # Use ConnectionType Enum, Added IdentifierComponent
+from physi_sim.core.entity_manager import EntityManager, EntityID # For type hinting if needed, Added EntityID
 # Use a forward reference for MainWindow and DrawingWidget to avoid circular imports at runtime
 # and satisfy type hinting.
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, List, Optional, Set # Added List, Optional, Set
 if TYPE_CHECKING:
     from physi_sim.graphics.main_window import MainWindow, DrawingWidget, ToolMode
 
@@ -28,6 +28,8 @@ class SelectToolHandler(BaseToolHandler):
         self.is_dragging_entity: bool = False
         self.drag_offset_from_entity_anchor: Vector2D = Vector2D(0, 0)
         self.drag_target_world_position: Vector2D | None = None
+        self.current_linkage_group_members: Optional[List[EntityID]] = None # RE-ADD for new linkage logic
+        self.primary_dragged_entity_id: Optional[EntityID] = None # To store the entity the user initially clicked
 
 
     def activate(self, drawing_widget: 'DrawingWidget'):
@@ -42,6 +44,8 @@ class SelectToolHandler(BaseToolHandler):
         self.is_dragging_entity = False
         self.drag_offset_from_entity_anchor = Vector2D(0, 0)
         self.drag_target_world_position = None
+        self.current_linkage_group_members = None # RE-ADD
+        self.primary_dragged_entity_id = None
         drawing_widget.setCursor(Qt.CursorShape.ArrowCursor)
 
 
@@ -51,6 +55,8 @@ class SelectToolHandler(BaseToolHandler):
         self.marquee_start_point = None
         self.marquee_end_point = None
         self.is_dragging_entity = False
+        self.current_linkage_group_members = None # RE-ADD
+        self.primary_dragged_entity_id = None
         drawing_widget.setCursor(Qt.CursorShape.ArrowCursor)
         # Clear any visual remnants if necessary, e.g., if marquee was active
         drawing_widget.update()
@@ -58,6 +64,8 @@ class SelectToolHandler(BaseToolHandler):
     def handle_mouse_press(self, event, drawing_widget: 'DrawingWidget'):
         main_window: 'MainWindow' = drawing_widget.window()
         entity_manager: EntityManager = main_window.entity_manager
+        self.current_linkage_group_members = None # Reset at the start of any press
+        self.primary_dragged_entity_id = None
 
         click_pos_screen = event.position()
         click_pos_world = drawing_widget._get_world_coordinates(click_pos_screen)
@@ -124,9 +132,47 @@ class SelectToolHandler(BaseToolHandler):
                 selected_transform = entity_manager.get_component(hit_entity_id, TransformComponent)
                 if selected_transform:
                     self.is_dragging_entity = True
-                    # drag_offset_from_entity_anchor should be relative to the entity's anchor (position)
+                    self.primary_dragged_entity_id = hit_entity_id
                     self.drag_offset_from_entity_anchor = selected_transform.position - click_pos_world
-                    self.drag_target_world_position = selected_transform.position # Initialize target
+                    self.drag_target_world_position = selected_transform.position
+
+                    # Build linkage group using BFS to find all connected entities via REVOLUTE_JOINT
+                    # This will find the entire connected component of the rigid body structure.
+                    if hit_entity_id: # Ensure hit_entity_id is not None
+                        linkage_members_set: Set[EntityID] = set()
+                        queue: List[EntityID] = [hit_entity_id]
+                        visited_for_linkage: Set[EntityID] = {hit_entity_id}
+                        
+                        all_connections = entity_manager.get_all_independent_components_of_type(ConnectionComponent)
+                        
+                        head = 0
+                        while head < len(queue):
+                            current_entity_in_bfs = queue[head]
+                            head += 1
+                            linkage_members_set.add(current_entity_in_bfs)
+
+                            for conn in all_connections:
+                                if conn.connection_type == ConnectionType.REVOLUTE_JOINT and not conn.is_broken:
+                                    partner_entity_id: Optional[EntityID] = None
+                                    if conn.source_entity_id == current_entity_in_bfs:
+                                        partner_entity_id = conn.target_entity_id
+                                    elif conn.target_entity_id == current_entity_in_bfs:
+                                        partner_entity_id = conn.source_entity_id
+                                    
+                                    if partner_entity_id and partner_entity_id not in visited_for_linkage:
+                                        visited_for_linkage.add(partner_entity_id)
+                                        queue.append(partner_entity_id)
+                        
+                        if len(linkage_members_set) > 0: # Check if any members were found (should include at least hit_entity_id)
+                            self.current_linkage_group_members = list(linkage_members_set)
+                            if len(self.current_linkage_group_members) > 1:
+                                print(f"Editor drag: Full revolute joint linkage group: {self.current_linkage_group_members}")
+                        else:
+                            self.current_linkage_group_members = None
+                    else:
+                        self.current_linkage_group_members = None
+
+
                     drawing_widget.setCursor(Qt.CursorShape.SizeAllCursor)
             else:
                 # No entity, spring, or connection was clicked - click was on empty space
@@ -150,16 +196,35 @@ class SelectToolHandler(BaseToolHandler):
         if self.is_marqueeing:
             self.marquee_end_point = current_pos_screen
             drawing_widget.update()
-        elif self.is_dragging_entity and main_window.selected_entity_ids:
-            if len(main_window.selected_entity_ids) == 1: # Simple drag for single entity
-                entity_id_to_move = list(main_window.selected_entity_ids)[0]
-                entity_transform = entity_manager.get_component(entity_id_to_move, TransformComponent)
-                if entity_transform:
-                    self.drag_target_world_position = current_pos_world + self.drag_offset_from_entity_anchor
-                    entity_transform.position = self.drag_target_world_position # Directly update
-                    # The main simulation loop in MainWindow will handle pinning this position if is_dragging_entity is true
-                    # For now, this direct update provides visual feedback.
-                    drawing_widget.update()
+        elif self.is_dragging_entity and self.primary_dragged_entity_id:
+            # Calculate the primary dragged entity's new potential position
+            primary_entity_current_transform = entity_manager.get_component(self.primary_dragged_entity_id, TransformComponent)
+            if not primary_entity_current_transform:
+                self.is_dragging_entity = False # Should not happen if drag started
+                return
+
+            new_primary_target_pos = current_pos_world + self.drag_offset_from_entity_anchor
+            delta_drag_world = new_primary_target_pos - primary_entity_current_transform.position
+
+            if self.current_linkage_group_members and len(self.current_linkage_group_members) > 0 : # Ensure primary is in it or it's not None
+                # Move all members of the linkage group by the same delta
+                for member_id in self.current_linkage_group_members:
+                    member_transform = entity_manager.get_component(member_id, TransformComponent)
+                    if member_transform:
+                        member_transform.position += delta_drag_world
+                
+                # Update the drag_target_world_position to reflect the primary entity's NEW position
+                updated_primary_transform = entity_manager.get_component(self.primary_dragged_entity_id, TransformComponent)
+                if updated_primary_transform:
+                    self.drag_target_world_position = updated_primary_transform.position
+                else:
+                    self.drag_target_world_position = new_primary_target_pos
+            else:
+                # Single entity drag
+                primary_entity_current_transform.position = new_primary_target_pos
+                self.drag_target_world_position = new_primary_target_pos
+            
+            drawing_widget.update()
         # No explicit update here, relies on DrawingWidget's general update for mouse move if needed for other things like snap points.
         # However, for marquee and drag, direct updates are better.
 
@@ -289,8 +354,10 @@ class SelectToolHandler(BaseToolHandler):
 
         elif self.is_dragging_entity:
             self.is_dragging_entity = False
-            self.drag_target_world_position = None # Clear target position
-            drawing_widget.setCursor(Qt.CursorShape.ArrowCursor) # Reset cursor
+            self.drag_target_world_position = None
+            self.current_linkage_group_members = None # Clear linkage group on release
+            self.primary_dragged_entity_id = None
+            drawing_widget.setCursor(Qt.CursorShape.ArrowCursor)
             # The actual position of the entity should have been updated during mouse_move.
             # MainWindow's simulation_step will handle pinning if necessary.
             drawing_widget.update()

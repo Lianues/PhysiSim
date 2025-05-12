@@ -288,6 +288,8 @@ class ConnectionType(Enum):
     ROD = auto()
     SPRING = auto()
     ROPE = auto()
+    REVOLUTE_JOINT = auto() # Generic revolute joint between two bodies
+    # REVOLUTE_JOINT_AXIS = auto() # DEPRECATED - use REVOLUTE_JOINT with one body potentially being a fixed "world" anchor if needed, or a dynamic axis entity.
 
 @dataclass
 class ConnectionComponent(Component):

@@ -1,5 +1,5 @@
 import math # Added for SAT
-from typing import TYPE_CHECKING, List, Tuple, Optional, TypedDict, Union # Add TypedDict and Union
+from typing import TYPE_CHECKING, List, Tuple, Optional, TypedDict, Union, Set # Add TypedDict, Union and Set
 from physi_sim.core.system import System
 from physi_sim.core.component import TransformComponent, GeometryComponent, PhysicsBodyComponent, ShapeType # Import ShapeType
 from physi_sim.core.vector import Vector2D # For distance calculation
@@ -18,6 +18,26 @@ class CollisionSystem(System):
     def __init__(self, entity_manager: 'EntityManager'):
         super().__init__(entity_manager)
         self.force_calculator = ForceCalculator(gravity_vector=GRAVITY_ACCELERATION) # Pass gravity
+        self.disabled_collision_pairs: Set[Tuple['EntityID', 'EntityID']] = set()
+
+    def disable_collision_pair(self, entity_id_a: 'EntityID', entity_id_b: 'EntityID') -> None:
+        """Disables collision detection between two entities."""
+        # Ensure consistent ordering of entity IDs in the tuple
+        pair = tuple(sorted((entity_id_a, entity_id_b)))
+        self.disabled_collision_pairs.add(pair)
+        # print(f"Collision disabled between {entity_id_a} and {entity_id_b}")
+
+    def enable_collision_pair(self, entity_id_a: 'EntityID', entity_id_b: 'EntityID') -> None:
+        """Enables collision detection between two entities."""
+        pair = tuple(sorted((entity_id_a, entity_id_b)))
+        if pair in self.disabled_collision_pairs:
+            self.disabled_collision_pairs.remove(pair)
+            # print(f"Collision enabled between {entity_id_a} and {entity_id_b}")
+
+    def is_collision_disabled(self, entity_id_a: 'EntityID', entity_id_b: 'EntityID') -> bool:
+        """Checks if collision is disabled between two entities."""
+        pair = tuple(sorted((entity_id_a, entity_id_b)))
+        return pair in self.disabled_collision_pairs
 
     def _check_circle_circle_collision(self,
                                        transform_a: TransformComponent, geometry_a: GeometryComponent,
@@ -349,25 +369,25 @@ class CollisionSystem(System):
         Returns (is_colliding, contact_manifold).
         Each contact point in the manifold contains point, normal (from B to A), and penetration_depth.
         """
-        # print(f"DEBUG_SAT: _check_polygon_polygon_collision_sat called for A: {entity_a_id}, B: {entity_b_id}") # DEBUG LOG - Commented out
+        # # print(f"DEBUG_SAT: _check_polygon_polygon_collision_sat called for A: {entity_a_id}, B: {entity_b_id}") # DEBUG LOG - Commented out
         geom_a = self.entity_manager.get_component(entity_a_id, GeometryComponent)
         geom_b = self.entity_manager.get_component(entity_b_id, GeometryComponent)
 
         if not geom_a or geom_a.shape_type not in [ShapeType.POLYGON, ShapeType.RECTANGLE]:
             # This function handles POLYGON-POLYGON and RECTANGLE-POLYGON (and RECT-RECT if called this way)
-            # print(f"DEBUG: _check_polygon_polygon_collision_sat called with invalid shape A: {entity_a_id}, type {geom_a.shape_type if geom_a else 'N/A'}")
+            # # print(f"DEBUG: _check_polygon_polygon_collision_sat called with invalid shape A: {entity_a_id}, type {geom_a.shape_type if geom_a else 'N/A'}")
             return False, None
         if not geom_b or geom_b.shape_type not in [ShapeType.POLYGON, ShapeType.RECTANGLE]:
-            # print(f"DEBUG: _check_polygon_polygon_collision_sat called with invalid shape B: {entity_b_id}, type {geom_b.shape_type if geom_b else 'N/A'}")
+            # # print(f"DEBUG: _check_polygon_polygon_collision_sat called with invalid shape B: {entity_b_id}, type {geom_b.shape_type if geom_b else 'N/A'}")
             return False, None
 
         vertices_a = self._get_rotated_vertices(entity_a_id)
         vertices_b = self._get_rotated_vertices(entity_b_id)
-        # print(f"DEBUG_SAT: entity_a_id={entity_a_id}, vertices_a={str(vertices_a)[:200]}") # DEBUG LOG - Truncate for brevity - Commented out
-        # print(f"DEBUG_SAT: entity_b_id={entity_b_id}, vertices_b={str(vertices_b)[:200]}") # DEBUG LOG - Truncate for brevity - Commented out
+        # # print(f"DEBUG_SAT: entity_a_id={entity_a_id}, vertices_a={str(vertices_a)[:200]}") # DEBUG LOG - Truncate for brevity - Commented out
+        # # print(f"DEBUG_SAT: entity_b_id={entity_b_id}, vertices_b={str(vertices_b)[:200]}") # DEBUG LOG - Truncate for brevity - Commented out
 
         if not vertices_a or not vertices_b:
-            # print(f"DEBUG: Could not get vertices for polygon collision: A empty: {not vertices_a}, B empty: {not vertices_b}")
+            # # print(f"DEBUG: Could not get vertices for polygon collision: A empty: {not vertices_a}, B empty: {not vertices_b}")
             return False, None # Entities might not be valid polygons or error in vertex retrieval
 
         axes_a = self._get_axes(vertices_a)
@@ -375,7 +395,7 @@ class CollisionSystem(System):
         
         all_axes = axes_a + axes_b
         if not all_axes:
-            # print("DEBUG: No axes found for polygon collision.")
+            # # print("DEBUG: No axes found for polygon collision.")
             return False, None
 
         min_penetration = float('inf')
@@ -399,18 +419,32 @@ class CollisionSystem(System):
                 trans_a = self.entity_manager.get_component(entity_a_id, TransformComponent)
                 trans_b = self.entity_manager.get_component(entity_b_id, TransformComponent)
                 if trans_a and trans_b:
-                    center_to_center_vec = trans_a.position - trans_b.position
-                    if center_to_center_vec.dot(collision_normal_internal) < 0:
+                    center_to_center_vec = trans_a.position - trans_b.position # Vector from B's center to A's center
+                    
+                    # Log before flipping attempt
+                    # print(f"LOG_SAT_PRE_FLIP: A={str(entity_a_id)[:8]}, B={str(entity_b_id)[:8]}")
+                    # print(f"  center_A={trans_a.position}, center_B={trans_b.position}")
+                    # print(f"  center_B_to_A_vec={center_to_center_vec}")
+                    # print(f"  initial_MTV_axis(collision_normal_internal)={collision_normal_internal}")
+                    dot_product = center_to_center_vec.dot(collision_normal_internal)
+                    # print(f"  dot_product (center_B_to_A_vec . initial_MTV_axis)={dot_product:.4f}")
+
+                    if dot_product < 0: # If MTV axis is opposite to B->A vector, flip MTV axis
                         collision_normal_internal = -collision_normal_internal
-        
+                        # print(f"  MTV_axis FLIPPED. New collision_normal_internal (B->A)={collision_normal_internal}")
+                    # else:
+                        # print(f"  MTV_axis NOT FLIPPED. collision_normal_internal (B->A) remains={collision_normal_internal}")
+                # else: # Should not happen if trans_a and trans_b are valid
+                #     # print(f"LOG_SAT_PRE_FLIP: Missing transform for A or B. A:{trans_a is not None}, B:{trans_b is not None}")
+
         if collision_normal_internal is None or min_penetration == float('inf') or min_penetration < 0: # min_penetration should be positive
-            # print(f"DEBUG: Polygon collision check failed: normal_internal is None or invalid penetration ({min_penetration})")
+            # # print(f"DEBUG: Polygon collision check failed: normal_internal is None or invalid penetration ({min_penetration})")
             return False, None
 
         # Ensure collision_normal_internal is normalized (it should be from _get_axes)
         if abs(collision_normal_internal.magnitude_squared() - 1.0) > EPSILON:
              collision_normal_internal = collision_normal_internal.normalize()
-        # print(f"DEBUG_SAT: Pre-contact find: entity_a_id={entity_a_id}, entity_b_id={entity_b_id}, collision_normal_internal={collision_normal_internal}, min_penetration={min_penetration}") # DEBUG LOG - Commented out
+        # # print(f"DEBUG_SAT: Pre-contact find: entity_a_id={entity_a_id}, entity_b_id={entity_b_id}, collision_normal_internal={collision_normal_internal}, min_penetration={min_penetration}") # DEBUG LOG - Commented out
 
 
         # Find contact points (as Vector2D)
@@ -425,12 +459,12 @@ class CollisionSystem(System):
         )
 
         if not contact_points_on_A_surface:
-            print(f"DEBUG_SAT: _find_contact_points_polygon_polygon for {entity_a_id} vs {entity_b_id} returned no points. Treating as no collision.")
+            # print(f"DEBUG_SAT: _find_contact_points_polygon_polygon for {entity_a_id} vs {entity_b_id} returned no points. Treating as no collision.")
             return False, None
 
         # Ensure we have exactly one contact point as per the new design objective for this function's output
         if len(contact_points_on_A_surface) != 1:
-            print(f"DEBUG_SAT: WARNING - _find_contact_points_polygon_polygon returned {len(contact_points_on_A_surface)} points, expected 1. Using the first one.")
+            # print(f"DEBUG_SAT: WARNING - _find_contact_points_polygon_polygon returned {len(contact_points_on_A_surface)} points, expected 1. Using the first one.")
             # Potentially log this as an issue or refine _find_contact_points_polygon_polygon further
             # if multiple points are still possible in some edge cases.
             # For now, take the first one if multiple, though ideally it should be one.
@@ -448,9 +482,9 @@ class CollisionSystem(System):
             "penetration_depth": min_penetration
         }]
         
-        print(f"DEBUG_SAT: Polygon-Polygon Collision. Entity A: {entity_a_id}, Entity B: {entity_b_id}")
-        print(f"DEBUG_SAT:   Normal (B->A): {collision_normal_internal}, Penetration: {min_penetration}")
-        print(f"DEBUG_SAT:   Contact Point (World on A's surface): {representative_contact_point_world}")
+        # print(f"DEBUG_SAT: Polygon-Polygon Collision. Entity A: {entity_a_id}, Entity B: {entity_b_id}")
+        # print(f"DEBUG_SAT:   Normal (B->A): {collision_normal_internal}, Penetration: {min_penetration}")
+        # print(f"DEBUG_SAT:   Contact Point (World on A's surface): {representative_contact_point_world}")
         return True, contact_manifold
 
     def _get_polygon_edges_with_outward_normals(self, vertices: List[Vector2D]) -> List[Tuple[Vector2D, Vector2D, Vector2D]]:
@@ -525,16 +559,16 @@ class CollisionSystem(System):
         intersection parameters with the two clipping lines.
         Returns the clipped segment (cp1, cp2) or None if no overlap or segment is outside.
         """
-        print(f"DEBUG_CLIP: Start clipping incident seg ({incident_v1}, {incident_v2}) against ref seg ({ref_v1}, {ref_v2})")
-        # print(f"DETAILED_LOG: _clip_line_segment_to_line_segment_region:") # Removed
-        # print(f"DETAILED_LOG:   incident_v1: {incident_v1}, incident_v2: {incident_v2}") # Removed
-        # print(f"DETAILED_LOG:   ref_v1: {ref_v1}, ref_v2: {ref_v2}") # Removed
+        # print(f"DEBUG_CLIP: Start clipping incident seg ({incident_v1}, {incident_v2}) against ref seg ({ref_v1}, {ref_v2})")
+        # # print(f"DETAILED_LOG: _clip_line_segment_to_line_segment_region:") # Removed
+        # # print(f"DETAILED_LOG:   incident_v1: {incident_v1}, incident_v2: {incident_v2}") # Removed
+        # # print(f"DETAILED_LOG:   ref_v1: {ref_v1}, ref_v2: {ref_v2}") # Removed
 
         ref_edge_vec = ref_v2 - ref_v1
         incident_edge_vec = incident_v2 - incident_v1
 
         if ref_edge_vec.magnitude_squared() < EPSILON * EPSILON:
-            print(f"DEBUG_CLIP: Reference edge is a point ({ref_v1}). Cannot form clipping region.")
+            # print(f"DEBUG_CLIP: Reference edge is a point ({ref_v1}). Cannot form clipping region.")
             # If incident segment itself is also a point and matches ref_v1, it's a point contact.
             if incident_edge_vec.magnitude_squared() < EPSILON * EPSILON and \
                (incident_v1 - ref_v1).magnitude_squared() < EPSILON * EPSILON:
@@ -571,22 +605,22 @@ class CollisionSystem(System):
 
         if abs(denom1) < EPSILON: # Incident segment is parallel to clip line 1
             if num1 < -EPSILON: # Incident segment is outside and parallel (P0-S).N < 0 means S is on the "wrong" side
-                print(f"DEBUG_CLIP: Parallel to clip line 1 and outside (num1={num1}). No clip.")
+                # print(f"DEBUG_CLIP: Parallel to clip line 1 and outside (num1={num1}). No clip.")
                 return None
             # else: parallel and inside or on the line, no change to t_enter/t_leave from this line
         else:
             t = num1 / denom1
             if denom1 > 0: # Line enters from outside to inside (D.N > 0)
                 t_enter = max(t_enter, t)
-                print(f"DEBUG_CLIP: ClipLine1 (enter): t={t:.3f}, t_enter={t_enter:.3f} (denom1={denom1:.3f}, num1={num1:.3f})")
-                # print(f"DETAILED_LOG:   ClipLine1 (enter): t_raw={t}, current t_enter={t_enter}") # Removed
+                # print(f"DEBUG_CLIP: ClipLine1 (enter): t={t:.3f}, t_enter={t_enter:.3f} (denom1={denom1:.3f}, num1={num1:.3f})")
+                # # print(f"DETAILED_LOG:   ClipLine1 (enter): t_raw={t}, current t_enter={t_enter}") # Removed
             else: # Line leaves from inside to outside (D.N < 0)
                 t_leave = min(t_leave, t)
-                print(f"DEBUG_CLIP: ClipLine1 (leave): t={t:.3f}, t_leave={t_leave:.3f} (denom1={denom1:.3f}, num1={num1:.3f})")
-                # print(f"DETAILED_LOG:   ClipLine1 (leave): t_raw={t}, current t_leave={t_leave}") # Removed
+                # print(f"DEBUG_CLIP: ClipLine1 (leave): t={t:.3f}, t_leave={t_leave:.3f} (denom1={denom1:.3f}, num1={num1:.3f})")
+                # # print(f"DETAILED_LOG:   ClipLine1 (leave): t_raw={t}, current t_leave={t_leave}") # Removed
 
         if t_enter > t_leave + EPSILON: # +EPSILON for robustness with floating point comparisons
-            print(f"DEBUG_CLIP: t_enter ({t_enter:.3f}) > t_leave ({t_leave:.3f}) after clip line 1. No clip.")
+            # print(f"DEBUG_CLIP: t_enter ({t_enter:.3f}) > t_leave ({t_leave:.3f}) after clip line 1. No clip.")
             return None
 
         # Clip against Line 2 (at ref_v2, normal against ref_edge_vec)
@@ -596,34 +630,34 @@ class CollisionSystem(System):
 
         if abs(denom2) < EPSILON: # Incident segment is parallel to clip line 2
             if num2 < -EPSILON: # Incident segment is outside and parallel
-                print(f"DEBUG_CLIP: Parallel to clip line 2 and outside (num2={num2}). No clip.")
+                # print(f"DEBUG_CLIP: Parallel to clip line 2 and outside (num2={num2}). No clip.")
                 return None
         else:
             t = num2 / denom2
             if denom2 > 0: # Line enters from outside to inside
                 t_enter = max(t_enter, t)
-                print(f"DEBUG_CLIP: ClipLine2 (enter): t={t:.3f}, t_enter={t_enter:.3f} (denom2={denom2:.3f}, num2={num2:.3f})")
-                # print(f"DETAILED_LOG:   ClipLine2 (enter): t_raw={t}, current t_enter={t_enter}") # Removed
+                # print(f"DEBUG_CLIP: ClipLine2 (enter): t={t:.3f}, t_enter={t_enter:.3f} (denom2={denom2:.3f}, num2={num2:.3f})")
+                # # print(f"DETAILED_LOG:   ClipLine2 (enter): t_raw={t}, current t_enter={t_enter}") # Removed
             else: # Line leaves from inside to outside
                 t_leave = min(t_leave, t)
-                print(f"DEBUG_CLIP: ClipLine2 (leave): t={t:.3f}, t_leave={t_leave:.3f} (denom2={denom2:.3f}, num2={num2:.3f})")
-                # print(f"DETAILED_LOG:   ClipLine2 (leave): t_raw={t}, current t_leave={t_leave}") # Removed
+                # print(f"DEBUG_CLIP: ClipLine2 (leave): t={t:.3f}, t_leave={t_leave:.3f} (denom2={denom2:.3f}, num2={num2:.3f})")
+                # # print(f"DETAILED_LOG:   ClipLine2 (leave): t_raw={t}, current t_leave={t_leave}") # Removed
         
         if t_enter > t_leave + EPSILON:
-            print(f"DEBUG_CLIP: t_enter ({t_enter:.3f}) > t_leave ({t_leave:.3f}) after clip line 2. No clip.")
+            # print(f"DEBUG_CLIP: t_enter ({t_enter:.3f}) > t_leave ({t_leave:.3f}) after clip line 2. No clip.")
             return None
 
         # Ensure t_enter and t_leave are within [0,1] range of the original incident segment
         final_t_start = max(0.0, t_enter)
         final_t_end = min(1.0, t_leave)
         
-        print(f"DEBUG_CLIP: Original t_range: [0,1]. Clipped t_range before [0,1] clamp: [{t_enter:.3f}, {t_leave:.3f}]")
-        print(f"DEBUG_CLIP: Final t_range after [0,1] clamp: [{final_t_start:.3f}, {final_t_end:.3f}]")
-        # print(f"DETAILED_LOG:   t_enter_final: {final_t_start}, t_leave_final: {final_t_end}") # Removed
+        # print(f"DEBUG_CLIP: Original t_range: [0,1]. Clipped t_range before [0,1] clamp: [{t_enter:.3f}, {t_leave:.3f}]")
+        # print(f"DEBUG_CLIP: Final t_range after [0,1] clamp: [{final_t_start:.3f}, {final_t_end:.3f}]")
+        # # print(f"DETAILED_LOG:   t_enter_final: {final_t_start}, t_leave_final: {final_t_end}") # Removed
 
 
         if final_t_start > final_t_end + EPSILON : # Segment is completely outside or reduced to less than a point
-            print(f"DEBUG_CLIP: Final t_start ({final_t_start:.3f}) > final_t_end ({final_t_end:.3f}). No valid clipped segment.")
+            # print(f"DEBUG_CLIP: Final t_start ({final_t_start:.3f}) > final_t_end ({final_t_end:.3f}). No valid clipped segment.")
             return None
         
         # If the segment is extremely short (effectively a point)
@@ -631,19 +665,19 @@ class CollisionSystem(System):
              # Check if this point is within the original [0,1] range of the incident segment
             if 0.0 - EPSILON <= final_t_start <= 1.0 + EPSILON:
                 clipped_point = incident_v1 + incident_edge_vec * final_t_start
-                print(f"DEBUG_CLIP: Clipped segment is a point: {clipped_point}")
-                # print(f"DETAILED_LOG:   Clipped result is a point: {clipped_point}") # Removed
+                # print(f"DEBUG_CLIP: Clipped segment is a point: {clipped_point}")
+                # # print(f"DETAILED_LOG:   Clipped result is a point: {clipped_point}") # Removed
                 return clipped_point, clipped_point
             else: # Point is outside original segment
-                print(f"DEBUG_CLIP: Clipped point {final_t_start:.3f} is outside original segment [0,1]. No clip.")
+                # print(f"DEBUG_CLIP: Clipped point {final_t_start:.3f} is outside original segment [0,1]. No clip.")
                 return None
 
 
         clipped_v1 = incident_v1 + incident_edge_vec * final_t_start
         clipped_v2 = incident_v1 + incident_edge_vec * final_t_end
         
-        print(f"DEBUG_CLIP: Successfully clipped segment: ({clipped_v1} -> {clipped_v2})")
-        # print(f"DETAILED_LOG:   Clipped result segment: v1={clipped_v1}, v2={clipped_v2}") # Removed
+        # print(f"DEBUG_CLIP: Successfully clipped segment: ({clipped_v1} -> {clipped_v2})")
+        # # print(f"DETAILED_LOG:   Clipped result segment: v1={clipped_v1}, v2={clipped_v2}") # Removed
         return clipped_v1, clipped_v2
 
 
@@ -662,115 +696,27 @@ class CollisionSystem(System):
         This implementation uses edge clipping to find a contact manifold (line segment)
         and returns its midpoint as the single representative contact point.
         """
-        print(f"DEBUG_CONTACT_MANIFOLD: ======== Start _find_contact_points_polygon_polygon ========")
-        # print(f"DETAILED_LOG: _find_contact_points_polygon_polygon called with:") # Removed
-        # print(f"DETAILED_LOG:   vertices_a (count: {len(vertices_a)}): {vertices_a}") # Removed
-        # print(f"DETAILED_LOG:   vertices_b (count: {len(vertices_b)}): {vertices_b}") # Removed
-        # print(f"DETAILED_LOG:   collision_normal (B->A): {collision_normal}") # Removed
-        # print(f"DETAILED_LOG:   penetration: {penetration}") # Removed
-        # print(f"DETAILED_LOG:   is_fixed_a: {is_fixed_a}, is_fixed_b: {is_fixed_b}") # Removed
-        print(f"DEBUG_CONTACT_MANIFOLD:   Poly A Vertices ({len(vertices_a)}): {str(vertices_a)}")
-        print(f"DEBUG_CONTACT_MANIFOLD:   Poly B Vertices ({len(vertices_b)}): {str(vertices_b)}") # Keeping original for context if needed
-        print(f"DEBUG_CONTACT_MANIFOLD:   Collision Normal (B->A): {collision_normal}, Penetration: {penetration}") # Keeping original
+        # print(f"DEBUG_CONTACT_MANIFOLD: ======== Start _find_contact_points_polygon_polygon ========")
+        # # print(f"DETAILED_LOG: _find_contact_points_polygon_polygon called with:") # Removed
+        # # print(f"DETAILED_LOG:   vertices_a (count: {len(vertices_a)}): {vertices_a}") # Removed
+        # # print(f"DETAILED_LOG:   vertices_b (count: {len(vertices_b)}): {vertices_b}") # Removed
+        # # print(f"DETAILED_LOG:   collision_normal (B->A): {collision_normal}") # Removed
+        # # print(f"DETAILED_LOG:   penetration: {penetration}") # Removed
+        # # print(f"DETAILED_LOG:   is_fixed_a: {is_fixed_a}, is_fixed_b: {is_fixed_b}") # Removed
+        # print(f"DEBUG_CONTACT_MANIFOLD:   Poly A Vertices ({len(vertices_a)}): {str(vertices_a)}")
+        # print(f"DEBUG_CONTACT_MANIFOLD:   Poly B Vertices ({len(vertices_b)}): {str(vertices_b)}") # Keeping original for context if needed
+        # print(f"DEBUG_CONTACT_MANIFOLD:   Collision Normal (B->A): {collision_normal}, Penetration: {penetration}") # Keeping original
 
         if not vertices_a or not vertices_b:
-            print("DEBUG_CONTACT_MANIFOLD:   Error: Empty vertices list provided.")
+            # print("DEBUG_CONTACT_MANIFOLD:   Error: Empty vertices list provided.")
             return []
         
-        # ---地面接触的特殊处理逻辑开始---
-        # 检查碰撞法线是否接近垂直，以及其中一个物体是否为“地面”
-        # 假设地面是固定的 (is_fixed = True)
-        # 碰撞法线 collision_normal 指向物体A (B->A)
+        # --- Enhanced Feature Recognition Logic ---
+        # The previous ground contact heuristic has been removed as it caused issues with partial overlaps.
+        # The general SAT + feature finding logic below should handle these cases more robustly.
+        # print(f"LOG_CONTACT_GEN:   Skipping specialized ground contact heuristic. Using general polygon-polygon logic.")
 
-        # 获取实体ID以便查询 PhysicsBodyComponent
-        # 这个方法没有直接传递实体ID，这是一个潜在的问题。
-        # 碰撞法线 collision_normal 指向物体A (B->A)
-        
-        is_ground_contact_scenario = False
-        ground_like_normal_y_threshold = 0.98 # cos(acos(0.98)) approx 11.5 degrees from vertical
-        
-        # 确定哪个物体是地面 (fixed)，哪个是动态物体 (not fixed)
-        # collision_normal is from B to A.
-        # Case 1: A is fixed (ground), B is dynamic. Normal B->A is ground normal.
-        # Case 2: B is fixed (ground), A is dynamic. Normal B->A is into ground. Ground normal is - (B->A) = A->B.
-        
-        dynamic_object_vertices: Optional[List[Vector2D]] = None
-        effective_ground_normal: Optional[Vector2D] = None # Normal pointing OUT of the ground, towards the dynamic object
-
-        if is_fixed_a and not is_fixed_b: # A is ground, B is dynamic
-            # collision_normal (B->A) is the normal pointing from dynamic B towards ground A.
-            # So, the effective ground normal (pointing from ground A to dynamic B) is -collision_normal.
-            # We want to find points on B that are "lowest" relative to ground A, along collision_normal.
-            # This means finding vertices in B that have the smallest projection along collision_normal.
-            dynamic_object_vertices = vertices_b
-            effective_ground_normal = -collision_normal # Points from A (ground) to B (dynamic)
-            # print(f"DETAILED_LOG: Ground Scenario: A is ground (fixed), B is dynamic. Effective ground normal (A->B): {effective_ground_normal}") # Removed
-        elif not is_fixed_a and is_fixed_b: # B is ground, A is dynamic
-            dynamic_object_vertices = vertices_a
-            effective_ground_normal = collision_normal # Points from B (ground) to A (dynamic)
-            # print(f"DETAILED_LOG: Ground Scenario: B is ground (fixed), A is dynamic. Effective ground normal (B->A): {effective_ground_normal}") # Removed
-        elif is_fixed_a and is_fixed_b: # Both fixed
-            # print(f"DETAILED_LOG: Both objects are fixed. Ground contact heuristic skipped.") # Removed
-            pass
-        else: # Both dynamic
-            # print(f"DETAILED_LOG: Both objects are dynamic. Ground contact heuristic skipped.") # Removed
-            pass
-
-        # Apply ground contact heuristic ONLY if one object is fixed and the other is dynamic,
-        # AND the effective ground normal is close to vertical.
-        is_one_fixed_one_dynamic = (is_fixed_a and not is_fixed_b) or (not is_fixed_a and is_fixed_b)
-
-        if is_one_fixed_one_dynamic and dynamic_object_vertices and effective_ground_normal and \
-           (abs(effective_ground_normal.x) < (1.0 - ground_like_normal_y_threshold) and \
-            abs(effective_ground_normal.y) > ground_like_normal_y_threshold) :
-            
-            is_ground_contact_scenario = True
-            # print(f"DETAILED_LOG: Ground contact heuristic activated. Effective ground normal: {effective_ground_normal}") # Removed
-            
-            min_projection_val = float('inf')
-            potential_contact_points_world = []
-            
-            # print(f"DETAILED_LOG: Ground Heuristic: Calculating projections for {len(dynamic_object_vertices)} dynamic_object_vertices onto effective_ground_normal {effective_ground_normal}:") # Removed
-            vertex_projections = []
-            for i, v_world in enumerate(dynamic_object_vertices):
-                projection = v_world.dot(effective_ground_normal)
-                vertex_projections.append({'vertex_index': i, 'vertex': v_world, 'projection': projection})
-                # print(f"DETAILED_LOG:   Vertex {i}: {v_world}, Projection: {projection}") # Removed
-
-            if vertex_projections:
-                min_projection_val = min(vp['projection'] for vp in vertex_projections)
-                # print(f"DETAILED_LOG:   Absolute min_projection_val found: {min_projection_val}") # Removed
-
-            for vp in vertex_projections:
-                if abs(vp['projection'] - min_projection_val) < EPSILON:
-                    potential_contact_points_world.append(vp['vertex'])
-            
-            # print(f"DETAILED_LOG:   Potential contact points based on min_projection_val ({min_projection_val}) and EPSILON ({EPSILON}): {potential_contact_points_world}") # Removed
-
-            if potential_contact_points_world:
-                if len(potential_contact_points_world) == 1:
-                    contact_point_world = potential_contact_points_world[0]
-                    # print(f"DETAILED_LOG: Ground contact - single lowest point on dynamic object: {contact_point_world}") # Removed
-                else:
-                    cx = sum(p.x for p in potential_contact_points_world) / len(potential_contact_points_world)
-                    cy = sum(p.y for p in potential_contact_points_world) / len(potential_contact_points_world)
-                    contact_point_world = Vector2D(cx, cy)
-                    # print(f"DETAILED_LOG: Ground contact - multiple points, midpoint on dynamic object: {contact_point_world}") # Removed
-                
-                # print(f"DETAILED_LOG: Ground contact logic returning point on dynamic object: {contact_point_world}") # Removed
-                return [contact_point_world]
-            # else: # Removed
-                # print(f"DETAILED_LOG: Ground contact logic identified, but no potential contact points found. Proceeding with standard SAT.") # Removed
-        # elif dynamic_object_vertices and effective_ground_normal : # Normal not vertical enough # Removed
-            # print(f"DETAILED_LOG: Effective ground normal {effective_ground_normal} not vertical enough for ground heuristic.") # Removed
-
-
-
-        # 1a. Determine Reference Edge on Polygon A
-                
-
-
-        # 1a. Determine Reference Edge on Polygon A
+        # Step a: Find deepest penetrating vertices of B (incident body)
         # Reference edge on A: its outward normal is most anti-parallel to collision_normal (B->A).
         # So, edge_normal_a.dot(collision_normal) is minimized (closest to -1).
         # Or, edge_normal_a.dot(-collision_normal) is maximized (closest to +1).
@@ -778,52 +724,112 @@ class CollisionSystem(System):
         
         ref_edge_info_A = self._find_best_matching_edge(vertices_a, -collision_normal)
         if not ref_edge_info_A:
-            print("DEBUG_CONTACT_MANIFOLD:   Error: Could not find reference edge on Polygon A.")
+            # print("DEBUG_CONTACT_MANIFOLD:   Error: Could not find reference edge on Polygon A.")
             # Fallback to a simple point (e.g., center of B pushed back)
             center_b = sum(vertices_b, Vector2D(0,0)) / len(vertices_b) if vertices_b else Vector2D(0,0)
             return [center_b - collision_normal * penetration]
         
         ref_edge_v1_a, ref_edge_v2_a, ref_edge_normal_a = ref_edge_info_A
-        print(f"DEBUG_CONTACT_MANIFOLD:   Reference Edge A: ({ref_edge_v1_a} -> {ref_edge_v2_a}), Normal_A_out: {ref_edge_normal_a}")
-        # print(f"DETAILED_LOG:   Selected Reference Edge A (v1, v2, normal_out): {ref_edge_info_A}") # Removed
+        # print(f"DEBUG_CONTACT_MANIFOLD:   Reference Edge A: ({ref_edge_v1_a} -> {ref_edge_v2_a}), Normal_A_out: {ref_edge_normal_a}")
+        # # print(f"DETAILED_LOG:   Selected Reference Edge A (v1, v2, normal_out): {ref_edge_info_A}") # Removed
 
+        # --- PRIORITY: Vertex-Face Contact Check (based on deepest penetrating point of B relative to A's reference face) ---
+        # ref_edge_normal_a is the outward normal of A's reference edge.
+        # We want to find vertices of B that are "deepest" into A's half-space defined by this reference edge.
+        min_signed_dist_to_A_face = float('inf')
+        deepest_vertices_b_list: List[Vector2D] = []
+        if not vertices_b: # Should be caught earlier
+            # print("DEBUG_CONTACT_MANIFOLD:   Error: vertices_b is empty before primary vertex-face check.")
+            return [(ref_edge_v1_a + ref_edge_v2_a) * 0.5]
+
+        for v_b_candidate in vertices_b:
+            # Calculate signed distance from v_b_candidate to the plane of A's reference edge.
+            # A negative distance indicates penetration into A's material (if ref_edge_normal_a points outward from A).
+            dist_to_ref_plane = (v_b_candidate - ref_edge_v1_a).dot(ref_edge_normal_a)
+            if abs(dist_to_ref_plane - min_signed_dist_to_A_face) < EPSILON: # Allow for multiple vertices at the same depth
+                deepest_vertices_b_list.append(v_b_candidate)
+            elif dist_to_ref_plane < min_signed_dist_to_A_face:
+                min_signed_dist_to_A_face = dist_to_ref_plane
+                deepest_vertices_b_list = [v_b_candidate]
+        
+        # print(f"DEBUG_CONTACT_MANIFOLD:   Primary V-F Check: Min signed dist to A's ref face: {min_signed_dist_to_A_face:.4f}, Num deepest B vertices: {len(deepest_vertices_b_list)}")
+
+        is_point_feature_contact = False
+        incident_feature_point_b: Optional[Vector2D] = None
+
+        if len(deepest_vertices_b_list) == 1:
+            is_point_feature_contact = True
+            incident_feature_point_b = deepest_vertices_b_list[0]
+            # print(f"DEBUG_CONTACT_MANIFOLD:   Primary V-F Check: Single deepest vertex B: {incident_feature_point_b}")
+        elif len(deepest_vertices_b_list) == 2:
+            v1_b, v2_b = deepest_vertices_b_list[0], deepest_vertices_b_list[1]
+            # Consider them a "point feature" if they are very close (e.g., a very short edge)
+            # This threshold might need tuning.
+            vertex_cluster_threshold_sq = (EPSILON * 20)**2 # Increased threshold slightly
+            if (v1_b - v2_b).magnitude_squared() < vertex_cluster_threshold_sq:
+                is_point_feature_contact = True
+                incident_feature_point_b = (v1_b + v2_b) * 0.5
+                # print(f"DEBUG_CONTACT_MANIFOLD:   Primary V-F Check: Two very close deepest B vertices, using midpoint: {incident_feature_point_b}")
+            # else:
+                # print(f"DEBUG_CONTACT_MANIFOLD:   Primary V-F Check: Two deepest B vertices are not close enough to be a single point feature.")
+        # else: # More than 2 deepest vertices, likely a face.
+             # print(f"DEBUG_CONTACT_MANIFOLD:   Primary V-F Check: {len(deepest_vertices_b_list)} deepest B vertices, not a point feature.")
+
+
+        if is_point_feature_contact and incident_feature_point_b:
+            # print(f"DEBUG_CONTACT_MANIFOLD:   Prioritizing Vertex-Face contact based on deepest point(s) of B. Incident Feature B: {incident_feature_point_b}")
+            
+            projected_contact_on_A_line = self._project_point_onto_line(incident_feature_point_b, ref_edge_v1_a, ref_edge_v2_a)
+            
+            ref_edge_segment_vec = ref_edge_v2_a - ref_edge_v1_a
+            if ref_edge_segment_vec.magnitude_squared() < EPSILON * EPSILON:
+                final_contact_point_on_A = ref_edge_v1_a
+            else:
+                t = (projected_contact_on_A_line - ref_edge_v1_a).dot(ref_edge_segment_vec) / ref_edge_segment_vec.magnitude_squared()
+                clamped_t = max(0.0, min(1.0, t))
+                final_contact_point_on_A = ref_edge_v1_a + ref_edge_segment_vec * clamped_t
+            
+            # print(f"DEBUG_CONTACT_MANIFOLD:   Vertex-Face contact point (on A's surface): {final_contact_point_on_A}")
+            # print(f"DEBUG_CONTACT_MANIFOLD: ======== End _find_contact_points_polygon_polygon (Priority Vertex-Face) ========")
+            return [final_contact_point_on_A]
+
+        # --- If not a clear Vertex-Face, proceed to find incident edge and then clip ---
+        # print(f"DEBUG_CONTACT_MANIFOLD:   No clear single-point V-F contact. Proceeding to find incident edge for B.")
         # 1b. Determine Incident Edge on Polygon B
         # Incident edge on B: its outward normal is most parallel to collision_normal (B->A).
         # So, edge_normal_b.dot(collision_normal) is maximized (closest to +1).
         inc_edge_info_B = self._find_best_matching_edge(vertices_b, collision_normal)
         if not inc_edge_info_B:
-            print("DEBUG_CONTACT_MANIFOLD:   Error: Could not find incident edge on Polygon B.")
-            center_b = sum(vertices_b, Vector2D(0,0)) / len(vertices_b) if vertices_b else Vector2D(0,0)
-            return [center_b - collision_normal * penetration]
+            # print("DEBUG_CONTACT_MANIFOLD:   Error: Could not find incident edge on Polygon B (after V-F check).")
+            # Fallback, though primary V-F should have caught pure vertex contacts.
+            # This might happen if V-F was borderline and then no good edge found.
+            if deepest_vertices_b_list: # Use average of deepest if available
+                 center_b = sum(deepest_vertices_b_list, Vector2D(0,0)) / len(deepest_vertices_b_list)
+                 return [center_b - collision_normal * penetration] # Push back along normal
+            center_b_fallback = sum(vertices_b, Vector2D(0,0)) / len(vertices_b) if vertices_b else Vector2D(0,0)
+            return [center_b_fallback - collision_normal * penetration]
 
-        inc_edge_v1_b, inc_edge_v2_b, inc_edge_normal_b = inc_edge_info_B
-        print(f"DEBUG_CONTACT_MANIFOLD:   Incident Edge B: ({inc_edge_v1_b} -> {inc_edge_v2_b}), Normal_B_out: {inc_edge_normal_b}")
-        # print(f"DETAILED_LOG:   Selected Incident Edge B (v1, v2, normal_out): {inc_edge_info_B}") # Removed
 
-        # 2. Clip Incident Edge B to the support region of Reference Edge A
-        # The support region of Ref Edge A is defined by lines perpendicular to Ref Edge A, passing through its endpoints.
-        # We clip Inc Edge B against these two lines.
+        inc_edge_v1_b, inc_edge_v2_b, inc_edge_normal_b = inc_edge_info_B # inc_edge_normal_b is outward normal of B's edge
+        # print(f"DEBUG_CONTACT_MANIFOLD:   Selected Incident Edge B for clipping: ({inc_edge_v1_b} -> {inc_edge_v2_b}), Normal_B_out: {inc_edge_normal_b}")
         
-        # The incident edge (inc_edge_v1_b, inc_edge_v2_b) needs to be projected onto the line of ref_edge_a
-        # and then clipped.
-        # A more direct clipping method:
-        # Clip inc_edge_b against the "sides" of ref_edge_a.
-        # The "sides" are lines perpendicular to ref_edge_a, passing through ref_edge_v1_a and ref_edge_v2_a.
-
+        # --- Edge-Edge Contact (Clipping) Logic --- (This was the previous V-F check location, now it's just edge-edge)
+        # print(f"DEBUG_CONTACT_MANIFOLD:   Proceeding with Edge-Edge (clipping) logic using selected incident edge B.")
+        
         clipped_incident_segment = self._clip_line_segment_to_line_segment_region(
             inc_edge_v1_b, inc_edge_v2_b,
             ref_edge_v1_a, ref_edge_v2_a
         )
 
         if not clipped_incident_segment:
-            print("DEBUG_CONTACT_MANIFOLD:   Clipping failed or resulted in no segment. Attempting vertex-based fallback.")
+            # print("DEBUG_CONTACT_MANIFOLD:   Clipping failed or resulted in no segment. Attempting vertex-based fallback.")
             # Fallback: project the most penetrating vertex of B onto reference edge A.
             # Find vertex of B "deepest" along collision_normal (B->A).
             # This means its projection on collision_normal is minimal.
             min_proj_val_b = float('inf')
             deepest_vertex_b: Optional[Vector2D] = None
             if not vertices_b:
-                 print("DEBUG_CONTACT_MANIFOLD:   Error: vertices_b is empty in fallback.")
+                 # print("DEBUG_CONTACT_MANIFOLD:   Error: vertices_b is empty in fallback.")
                  return [(ref_edge_v1_a + ref_edge_v2_a) * 0.5] # Last resort
 
             for v_b_candidate in vertices_b:
@@ -844,14 +850,14 @@ class CollisionSystem(System):
                     clamped_t = max(0.0, min(1.0, t))
                     final_contact_point_on_A = ref_edge_v1_a + ref_edge_segment_vec * clamped_t
                 
-                print(f"DEBUG_CONTACT_MANIFOLD:   Fallback: Deepest B vertex {deepest_vertex_b} projected to Ref Edge A as {final_contact_point_on_A}")
-                # print(f"DETAILED_LOG:   Fallback contact point: {final_contact_point_on_A}") # Removed
-                print(f"DEBUG_CONTACT_MANIFOLD: ======== End _find_contact_points_polygon_polygon (Fallback) ========")
+                # print(f"DEBUG_CONTACT_MANIFOLD:   Fallback: Deepest B vertex {deepest_vertex_b} projected to Ref Edge A as {final_contact_point_on_A}")
+                # # print(f"DETAILED_LOG:   Fallback contact point: {final_contact_point_on_A}") # Removed
+                # print(f"DEBUG_CONTACT_MANIFOLD: ======== End _find_contact_points_polygon_polygon (Fallback) ========")
                 return [final_contact_point_on_A]
-            else:
-                print("DEBUG_CONTACT_MANIFOLD:   Fallback failed: no deepest vertex found on B. Using midpoint of reference edge A.")
+            # else:
+                # print("DEBUG_CONTACT_MANIFOLD:   Fallback failed: no deepest vertex found on B. Using midpoint of reference edge A.")
                 fallback_point = (ref_edge_v1_a + ref_edge_v2_a) * 0.5
-                # print(f"DETAILED_LOG:   Fallback (no deepest B vertex) contact point: {fallback_point}") # Removed
+                # # print(f"DETAILED_LOG:   Fallback (no deepest B vertex) contact point: {fallback_point}") # Removed
                 return [fallback_point]
 
         clip_p1, clip_p2 = clipped_incident_segment # These are on incident body B
@@ -878,14 +884,14 @@ class CollisionSystem(System):
         # The final contact point is the midpoint of this segment on A's surface
         final_contact_point_on_A = (final_proj_clip_p1_on_A + final_proj_clip_p2_on_A) * 0.5
         
-        print(f"DEBUG_CONTACT_MANIFOLD:   Clipped incident segment on B: ({clip_p1} -> {clip_p2})")
-        print(f"DEBUG_CONTACT_MANIFOLD:   Clipped P1 on B projected-clamped to A: {final_proj_clip_p1_on_A}")
-        print(f"DEBUG_CONTACT_MANIFOLD:   Clipped P2 on B projected-clamped to A: {final_proj_clip_p2_on_A}")
-        print(f"DEBUG_CONTACT_MANIFOLD:   Final Contact Point (Midpoint on A's surface): {final_contact_point_on_A}")
-        # print(f"DETAILED_LOG:   Clipped incident segment (on B): p1={clip_p1}, p2={clip_p2}") # Removed
-        # print(f"DETAILED_LOG:   Projected clipped segment on A: p1_proj={final_proj_clip_p1_on_A}, p2_proj={final_proj_clip_p2_on_A}") # Removed
-        # print(f"DETAILED_LOG:   Final representative contact_point_world: {final_contact_point_on_A}") # Removed
-        print(f"DEBUG_CONTACT_MANIFOLD: ======== End _find_contact_points_polygon_polygon (Success) ========")
+        # print(f"DEBUG_CONTACT_MANIFOLD:   Clipped incident segment on B: ({clip_p1} -> {clip_p2})")
+        # print(f"DEBUG_CONTACT_MANIFOLD:   Clipped P1 on B projected-clamped to A: {final_proj_clip_p1_on_A}")
+        # print(f"DEBUG_CONTACT_MANIFOLD:   Clipped P2 on B projected-clamped to A: {final_proj_clip_p2_on_A}")
+        # print(f"DEBUG_CONTACT_MANIFOLD:   Final Contact Point (Midpoint on A's surface): {final_contact_point_on_A}")
+        # # print(f"DETAILED_LOG:   Clipped incident segment (on B): p1={clip_p1}, p2={clip_p2}") # Removed
+        # # print(f"DETAILED_LOG:   Projected clipped segment on A: p1_proj={final_proj_clip_p1_on_A}, p2_proj={final_proj_clip_p2_on_A}") # Removed
+        # # print(f"DETAILED_LOG:   Final representative contact_point_world: {final_contact_point_on_A}") # Removed
+        # print(f"DEBUG_CONTACT_MANIFOLD: ======== End _find_contact_points_polygon_polygon (Success) ========")
         return [final_contact_point_on_A]
     def _find_contact_points_polygon_circle(self,
                                             polygon_vertices: List[Vector2D],
@@ -954,18 +960,18 @@ class CollisionSystem(System):
         if not polygon_transform or not polygon_geometry or \
            polygon_geometry.shape_type not in [ShapeType.POLYGON, ShapeType.RECTANGLE] or \
            not circle_transform or not circle_geometry or circle_geometry.shape_type != ShapeType.CIRCLE:
-            # print(f"DEBUG PC: Invalid shapes. Poly: {polygon_geometry.shape_type if polygon_geometry else 'N/A'}, Circle: {circle_geometry.shape_type if circle_geometry else 'N/A'}")
+            # # print(f"DEBUG PC: Invalid shapes. Poly: {polygon_geometry.shape_type if polygon_geometry else 'N/A'}, Circle: {circle_geometry.shape_type if circle_geometry else 'N/A'}")
             return False, None
 
         polygon_vertices = self._get_rotated_vertices(entity_polygon_id)
         if not polygon_vertices:
-            # print(f"DEBUG PC: No polygon vertices for {entity_polygon_id}")
+            # # print(f"DEBUG PC: No polygon vertices for {entity_polygon_id}")
             return False, None
 
         circle_center = circle_transform.position
         circle_radius = circle_geometry.parameters.get("radius", 0)
         if circle_radius <= 0:
-            # print(f"DEBUG PC: Circle {entity_circle_id} has invalid radius {circle_radius}")
+            # # print(f"DEBUG PC: Circle {entity_circle_id} has invalid radius {circle_radius}")
             return False, None
 
 
@@ -996,7 +1002,7 @@ class CollisionSystem(System):
             # else: circle center is on a vertex. Polygon axes should handle this.
 
         if not all_axes:
-            # print(f"DEBUG PC: No axes generated for polygon {entity_polygon_id} and circle {entity_circle_id}")
+            # # print(f"DEBUG PC: No axes generated for polygon {entity_polygon_id} and circle {entity_circle_id}")
             return False, None
 
         for axis in all_axes:
@@ -1029,7 +1035,7 @@ class CollisionSystem(System):
                     collision_normal_internal = -collision_normal_internal
         
         if collision_normal_internal is None or min_penetration == float('inf') or min_penetration < -EPSILON: # Allow very small negative due to float errors before correction
-            # print(f"DEBUG PC: Collision check failed. Normal: {collision_normal_internal}, Penetration: {min_penetration}")
+            # # print(f"DEBUG PC: Collision check failed. Normal: {collision_normal_internal}, Penetration: {min_penetration}")
             return False, None
         
         if abs(collision_normal_internal.magnitude_squared() - 1.0) > EPSILON: # Ensure normalization
@@ -1043,7 +1049,7 @@ class CollisionSystem(System):
         )
 
         if not contact_point_vectors:
-            # print(f"DEBUG PC: No contact points found for {entity_polygon_id} and {entity_circle_id}")
+            # # print(f"DEBUG PC: No contact points found for {entity_polygon_id} and {entity_circle_id}")
             return False, None
 
         contact_manifold: List[ContactPointInfo] = []
@@ -1054,7 +1060,7 @@ class CollisionSystem(System):
                 "penetration_depth": min_penetration
             })
         
-        # print(f"DEBUG: Polygon-Circle Collision DETECTED between poly {entity_polygon_id} and circle {entity_circle_id}. Normal: {collision_normal_internal}, Depth: {min_penetration}, Points: {len(contact_point_vectors)}")
+        # # print(f"DEBUG: Polygon-Circle Collision DETECTED between poly {entity_polygon_id} and circle {entity_circle_id}. Normal: {collision_normal_internal}, Depth: {min_penetration}, Points: {len(contact_point_vectors)}")
         return True, contact_manifold
 
     def _find_contact_points_rect_rect(self,
@@ -1414,17 +1420,17 @@ class CollisionSystem(System):
                                  contact_info: ContactPointInfo,
                                  dt: float) -> None:
         """
-        Handles the physics response (impulse, positional correction, friction, support) 
+        Handles the physics response (impulse, positional correction, friction, support)
         for a collision between two entities.
         Assumes contact_info.normal points from B to A.
         """
-        print(f"DEBUG_HCR: _handle_collision_response for A: {eid_a}, B: {eid_b}") # DEBUG LOG
-        print(f"DEBUG_HCR:   trans_a.position: {trans_a.position}, trans_b.position: {trans_b.position}") # DEBUG LOG - ADDED
+        # # print(f"DEBUG_HCR: _handle_collision_response for A: {eid_a}, B: {eid_b}") # DEBUG LOG
+        # # print(f"DEBUG_HCR:   trans_a.position: {trans_a.position}, trans_b.position: {trans_b.position}") # DEBUG LOG - ADDED
         contact_point_world = contact_info["point"]
         collision_normal_b_to_a = contact_info["normal"] # Expected: From B to A
         penetration = contact_info["penetration_depth"]
-        print(f"DEBUG_HCR:   CP World: {contact_point_world}, Normal (B->A): {collision_normal_b_to_a}, Pen: {penetration}") # DEBUG LOG
-        # print(f"DEBUG_HCR:   r_a: {r_a}, r_b: {r_b}") # DEBUG LOG - Commented out
+        # print(f"LOG_HCR_ENTRY: Entities A={eid_a}, B={eid_b}. CPWorld={contact_point_world}, Normal(B->A)={collision_normal_b_to_a}, Pen={penetration:.4f}")
+        # # print(f"DEBUG_HCR:   r_a: {r_a}, r_b: {r_b}") # DEBUG LOG - Commented out
 
         # This check should ideally be done before calling, but as a safeguard:
         if phys_a.is_fixed and phys_b.is_fixed:
@@ -1435,7 +1441,7 @@ class CollisionSystem(System):
         center_b = trans_b.position
         r_a = contact_point_world - center_a
         r_b = contact_point_world - center_b
-        # print(f"DEBUG_HCR:   r_a: {r_a}, r_b: {r_b}") # DEBUG LOG # Already commented above, ensuring it's off
+        # # print(f"DEBUG_HCR:   r_a: {r_a}, r_b: {r_b}") # DEBUG LOG # Already commented above, ensuring it's off
         v_linear_a = phys_a.velocity
         v_linear_b = phys_b.velocity
         angular_velocity_a = getattr(phys_a, 'angular_velocity', 0.0)
@@ -1475,19 +1481,19 @@ class CollisionSystem(System):
             if abs(denominator) > EPSILON:
                 # Standard impulse formula. If relative_velocity_normal is negative (approaching), j_scalar is positive.
                 j_scalar = -(1.0 + restitution) * relative_velocity_normal / denominator
-            # print(f"DEBUG_HCR:   j_linear: {j_scalar}") # DEBUG LOG - Commented out
+            # # print(f"DEBUG_HCR:   j_linear: {j_scalar}") # DEBUG LOG - Commented out
             
             # Apply impulse if significant
             if abs(j_scalar) > EPSILON:
                 # Impulse on A is along collision_normal_b_to_a (pushing A away from B along the normal from B to A)
-                impulse_vector_on_a = collision_normal_b_to_a * j_scalar 
+                impulse_vector_on_a = collision_normal_b_to_a * j_scalar
 
                 if not phys_a.is_fixed:
                     delta_linear_velocity_a_val = impulse_vector_on_a * inv_mass_a
                     delta_angular_velocity_a_val = 0.0
                     if inv_inertia_a > 0:
                         delta_angular_velocity_a_val = r_a.cross(impulse_vector_on_a) * inv_inertia_a
-                    # print(f"DEBUG_HCR:   To A: dLinVel={delta_linear_velocity_a_val}, dAngVel={delta_angular_velocity_a_val}") # DEBUG LOG - Commented out
+                    # # print(f"DEBUG_HCR:   To A: dLinVel={delta_linear_velocity_a_val}, dAngVel={delta_angular_velocity_a_val}") # DEBUG LOG - Commented out
                     phys_a.velocity += delta_linear_velocity_a_val
                     if inv_inertia_a > 0:
                         setattr(phys_a, 'angular_velocity', angular_velocity_a + delta_angular_velocity_a_val)
@@ -1499,20 +1505,20 @@ class CollisionSystem(System):
                     if inv_inertia_b > 0:
                          # Impulse on B is -impulse_vector_on_a. Angular impulse on B is r_b x (-impulse_vector_on_a) * inv_inertia_b
                         delta_angular_velocity_b_val = -r_b.cross(impulse_vector_on_a) * inv_inertia_b
-                    # print(f"DEBUG_HCR:   To B: dLinVel={delta_linear_velocity_b_val}, dAngVel={delta_angular_velocity_b_val}") # DEBUG LOG - Commented out
+                    # # print(f"DEBUG_HCR:   To B: dLinVel={delta_linear_velocity_b_val}, dAngVel={delta_angular_velocity_b_val}") # DEBUG LOG - Commented out
                     phys_b.velocity += delta_linear_velocity_b_val
                     if inv_inertia_b > 0:
                         setattr(phys_b, 'angular_velocity', angular_velocity_b + delta_angular_velocity_b_val)
 
         # --- Positional Correction ---
-        if penetration > EPSILON: 
+        if penetration > EPSILON:
             inv_mass_a_pc = 1.0 / phys_a.mass if phys_a.mass > 0 and not phys_a.is_fixed else 0.0
             inv_mass_b_pc = 1.0 / phys_b.mass if phys_b.mass > 0 and not phys_b.is_fixed else 0.0
             total_inv_mass_for_pc = inv_mass_a_pc + inv_mass_b_pc
 
             if total_inv_mass_for_pc > EPSILON:
                 correction_factor = 0.3 # Reduced from 0.6 to observe effect on flickering
-                print(f"DETAILED_LOG: Positional Correction: Using correction_factor = {correction_factor}")
+                # # print(f"DETAILED_LOG: Positional Correction: Using correction_factor = {correction_factor}")
                 # collision_normal_b_to_a points from B to A.
                 # A moves along collision_normal_b_to_a to separate.
                 # B moves along -collision_normal_b_to_a to separate.
@@ -1537,29 +1543,33 @@ class CollisionSystem(System):
         if not phys_a.is_fixed: # Object A must be dynamic to receive support
             can_B_support_A = phys_b.is_fixed or \
                               self.entity_manager.has_component(eid_b, SurfaceComponent) or \
-                              (not phys_b.is_fixed and collision_normal_b_to_a.dot(Vector2D(0,1)) > 0.707) # B is generally below A (normal B->A points somewhat up)
+                              (not phys_b.is_fixed and collision_normal_b_to_a.dot(Vector2D(0,1)) > 0.707) # B is generally below A, so normal B->A (support normal for A) points UP. (Assuming Y-up world)
 
             if can_B_support_A:
                 vel_a_current = phys_a.velocity
                 vel_b_current = phys_b.velocity
                 rel_vel_normal_current = (vel_a_current - vel_b_current).dot(collision_normal_b_to_a)
-                print(f"DEBUG_HCR: Support Check A on B (B is surface-like): rel_vel_normal_current={rel_vel_normal_current}, penetration={penetration}")
+                # # print(f"DEBUG_HCR: Support Check A on B (B is surface-like): rel_vel_normal_current={rel_vel_normal_current}, penetration={penetration}")
                 
-                support_condition_met_A_on_B = penetration >= 0 and abs(rel_vel_normal_current) < 0.05
-                print(f"DETAILED_LOG: SupportCheck A on B: pen={penetration:.8f}, (condition: pen >= 0), rel_vel_norm={rel_vel_normal_current:.8f}, abs_rel_vel_norm={abs(rel_vel_normal_current):.8f}, condition_met={support_condition_met_A_on_B}")
+                # Support condition: objects are penetrating or touching.
+                # The ForceCalculator will determine if a support force is actually needed based on net forces.
+                support_condition_met_A_on_B = penetration >= -EPSILON # Allow for minor floating point inaccuracies
+                # print(f"LOG_HCR_SUPPORT_CHECK: A_on_B: Pen={penetration:.4f}, RelVelNorm={rel_vel_normal_current:.4f}, ConditionMet={support_condition_met_A_on_B}")
 
                 if support_condition_met_A_on_B:
-                    print(f"DEBUG_HCR: Support Condition Met for A on B.")
+                    # # print(f"DEBUG_HCR: Support Condition Met for A on B.")
                     offset_world_a = contact_point_world - trans_a.position
                     contact_point_local_a = offset_world_a.rotate(-trans_a.angle)
-                    angle_deg_a = math.degrees(trans_a.angle)
-                    print(f"DETAILED_LOG: HCR_A_on_B: CP_world={contact_point_world}, trans_a_pos={trans_a.position}, trans_a_angle_rad={trans_a.angle:.4f}, trans_a_angle_deg={angle_deg_a:.2f}, offset_world_a={offset_world_a}, contact_point_local_a={contact_point_local_a}")
+                    # angle_deg_a = math.degrees(trans_a.angle)
+                    # # print(f"DETAILED_LOG: HCR_A_on_B: CP_world={contact_point_world}, trans_a_pos={trans_a.position}, trans_a_angle_rad={trans_a.angle:.4f}, trans_a_angle_deg={angle_deg_a:.2f}, offset_world_a={offset_world_a}, contact_point_local_a={contact_point_local_a}")
+                    # print(f"DEBUG_FC_CALL: Calling ForceCalculator for support: A={eid_a} (receiver) on B={eid_b} (surface-like)") # LOG
                     applied_support = self.force_calculator.calculate_and_apply_support_force(
                         eid_a, eid_b, collision_normal_b_to_a, contact_point_local_a, self.entity_manager
                     )
-                    print(f"DEBUG_HCR: Support for A on B - applied_support_magnitude: {applied_support}")
+                    # # print(f"DEBUG_HCR: Support for A on B - applied_support_magnitude: {applied_support}")
                     if applied_support is not None and applied_support > 0:
-                        print(f"DEBUG_HCR: Calling Friction for A on B with support: {applied_support}")
+                        # # print(f"DEBUG_HCR: Calling Friction for A on B with support: {applied_support}")
+                        # print(f"DEBUG_FC_CALL: Calling ForceCalculator for friction: A={eid_a} (receiver) on B={eid_b} (surface-like)") # LOG
                         self.force_calculator.calculate_and_apply_friction_force(
                             eid_a, eid_b, collision_normal_b_to_a, applied_support, contact_point_local_a, self.entity_manager, dt
                         )
@@ -1570,32 +1580,50 @@ class CollisionSystem(System):
         if not phys_b.is_fixed: # Object B must be dynamic to receive support
             can_A_support_B = phys_a.is_fixed or \
                               self.entity_manager.has_component(eid_a, SurfaceComponent) or \
-                              (not phys_a.is_fixed and (-collision_normal_b_to_a).dot(Vector2D(0,1)) > 0.707) # A is generally below B (normal A->B points somewhat up)
-            
+                              (not phys_a.is_fixed and (-collision_normal_b_to_a).dot(Vector2D(0,1)) > 0.707) # A is generally below B, so normal A->B (support normal for B) points UP. (Assuming Y-up world)
+           
             if can_A_support_B:
+                # normal_a_to_b is the normal FROM surface A TO object B.
+                # collision_normal_b_to_a is B->A.
+                # If B is on top of A, SAT's B->A normal points UPWARDS (e.g., (0, -1) if Y is down positive, or (0,1) if Y is up positive).
+                # The support force on B from A should also be UPWARDS (opposite to gravity on B).
+                # ForceCalculator expects normal FROM SURFACE (A) TO ENTITY_ON_SURFACE (B).
+                # collision_normal_b_to_a is B->A.
+                # So, normal_a_to_b must be -collision_normal_b_to_a.
                 normal_a_to_b = -collision_normal_b_to_a
+                # # print(f"DEBUG_HCR_NORMAL_FIX: For A supporting B: collision_normal_b_to_a (B->A) = {collision_normal_b_to_a}, Corrected normal_a_to_b (A->B, for FC) set to {normal_a_to_b}")
                 vel_a_current = phys_a.velocity
                 vel_b_current = phys_b.velocity
                 rel_vel_normal_current = (vel_b_current - vel_a_current).dot(normal_a_to_b)
-                print(f"DEBUG_HCR: Support Check B on A (A is surface-like): rel_vel_normal_current={rel_vel_normal_current}, penetration={penetration}")
+                # # print(f"DEBUG_HCR: Support Check B on A (A is surface-like): rel_vel_normal_current={rel_vel_normal_current}, penetration={penetration}")
 
-                support_condition_met_B_on_A = penetration >= 0 and abs(rel_vel_normal_current) < 0.05
-                print(f"DETAILED_LOG: SupportCheck B on A: pen={penetration:.8f}, (condition: pen >= 0), rel_vel_norm={rel_vel_normal_current:.8f}, abs_rel_vel_norm={abs(rel_vel_normal_current):.8f}, condition_met={support_condition_met_B_on_A}")
-
+                # Support condition: objects are penetrating or touching.
+                # The ForceCalculator will determine if a support force is actually needed based on net forces.
+                support_condition_met_B_on_A = penetration >= -EPSILON # Allow for minor floating point inaccuracies
+                # print(f"LOG_HCR_SUPPORT_CHECK: B_on_A: Pen={penetration:.4f}, RelVelNorm={rel_vel_normal_current:.4f}, ConditionMet={support_condition_met_B_on_A}")
+                
                 if support_condition_met_B_on_A:
-                    print(f"DEBUG_HCR: Support Condition Met for B on A.")
+                    # # print(f"DEBUG_HCR: Support Condition Met for B on A.")
                     offset_world_b = contact_point_world - trans_b.position
                     contact_point_local_b = offset_world_b.rotate(-trans_b.angle)
-                    angle_deg_b = math.degrees(trans_b.angle)
-                    print(f"DETAILED_LOG: HCR_B_on_A: CP_world={contact_point_world}, trans_b_pos={trans_b.position}, trans_b_angle_rad={trans_b.angle:.4f}, trans_b_angle_deg={angle_deg_b:.2f}, offset_world_b={offset_world_b}, contact_point_local_b={contact_point_local_b}")
+                    # angle_deg_b = math.degrees(trans_b.angle)
+                    # # print(f"DETAILED_LOG: HCR_B_on_A: CP_world={contact_point_world}, trans_b_pos={trans_b.position}, trans_b_angle_rad={trans_b.angle:.4f}, trans_b_angle_deg={angle_deg_b:.2f}, offset_world_b={offset_world_b}, contact_point_local_b={contact_point_local_b}")
+                    
+                    # Calculate the normal for ForceCalculator directly from -collision_normal_b_to_a
+                    # This ensures we are using the freshest, correctly negated value.
+                    normal_for_fc_BonA = -collision_normal_b_to_a
+                    # print(f"LOG_HCR_PRE_FC_BonA: eid_b={eid_b}, eid_a={eid_a}, CALC_normal_for_fc(A->B)={normal_for_fc_BonA}")
+
                     applied_support = self.force_calculator.calculate_and_apply_support_force(
-                        eid_b, eid_a, normal_a_to_b, contact_point_local_b, self.entity_manager
+                        eid_b, eid_a, normal_for_fc_BonA, contact_point_local_b, self.entity_manager
                     )
-                    print(f"DEBUG_HCR: Support for B on A - applied_support_magnitude: {applied_support}")
+                    # # print(f"DEBUG_HCR: Support for B on A - applied_support_magnitude: {applied_support}")
                     if applied_support is not None and applied_support > 0:
-                        print(f"DEBUG_HCR: Calling Friction for B on A with support: {applied_support}")
+                        # # print(f"DEBUG_HCR: Calling Friction for B on A with support: {applied_support}")
+                        # Pass the same freshly calculated normal to friction calculation
+                        # print(f"LOG_HCR_PRE_FC_FRICTION_BonA: eid_b={eid_b}, eid_a={eid_a}, CALC_normal_for_fc_friction(A->B)={normal_for_fc_BonA}")
                         self.force_calculator.calculate_and_apply_friction_force(
-                            eid_b, eid_a, normal_a_to_b, applied_support, contact_point_local_b, self.entity_manager, dt
+                            eid_b, eid_a, normal_for_fc_BonA, applied_support, contact_point_local_b, self.entity_manager, dt
                         )
 
     def update(self, dt: float) -> None:
@@ -1627,6 +1655,10 @@ class CollisionSystem(System):
 
             for j in range(i + 1, num_colliders):
                 eid_b, trans_b, geom_b, phys_b = potential_colliders[j]
+
+                # Skip if collision is disabled for this pair
+                if self.is_collision_disabled(eid_a, eid_b):
+                    continue
 
                 # Skip if both are fixed (or one is fixed, depending on desired interaction)
                 # if phys_a.is_fixed and phys_b.is_fixed:
@@ -1715,8 +1747,16 @@ class CollisionSystem(System):
                 
                 # --- Generic Collision Response Section ---
                 if collided_result and collided_result[0] and collided_result[1]:
+                    # print(f"DEBUG_COLLISION: Collision detected between {eid_a} and {eid_b}") # LOG
                     contact_manifold_to_use = collided_result[1]
                     
+                    # DEBUG LOG START: Collision detected and contact info (REMOVED)
+                    # print(f"[DEBUG CollisionSystem.update] Collision detected between {eid_a} ({type_a}) and {eid_b} ({type_b}).")
+                    # if contact_manifold_to_use:
+                    #     for c_info_idx, c_info in enumerate(contact_manifold_to_use):
+                    #         print(f"  Contact {c_info_idx + 1}: Point={c_info['point']}, Normal(B->A)={c_info['normal']}, Depth={c_info['penetration_depth']:.4f}")
+                    # DEBUG LOG END
+
                     if phys_a.is_fixed and phys_b.is_fixed:
                         continue # Skip response if both are fixed
                     
@@ -1729,6 +1769,7 @@ class CollisionSystem(System):
                     # or called per contact point, or average/select one.
                     # Current SAT contact finders for poly/rect return one point.
                     for contact_info in contact_manifold_to_use: # Typically one iteration for now
+                        # print(f"LOG_CS_UPDATE: Calling _handle_collision_response for A={eid_a}, B={eid_b} with contact_info: Normal(B->A)={contact_info['normal']}, Pen={contact_info['penetration_depth']:.4f}") # Detailed log before HCR
                         self._handle_collision_response(
                             eid_a, eid_b,
                             trans_a, trans_b,

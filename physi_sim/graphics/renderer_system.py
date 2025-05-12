@@ -10,19 +10,7 @@ from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QPolygonF, QFont # QPo
 from PySide6.QtCore import Qt, QPointF, QRectF # Added QPointF for polygon
 import uuid # For comparing UUIDs if selected_entity_id is UUID
 import math # For math.degrees for rotation
-
-# Need ForceAnalysisDisplayMode, potentially circular import risk.
-# Let's try importing and see. If it fails, define it locally or pass int/enum value.
-try:
-    from physi_sim.graphics.main_window import ForceAnalysisDisplayMode
-except ImportError:
-    # Fallback if circular import detected - define locally or expect integer
-    # This is less ideal. A better structure would avoid this.
-    from enum import Enum, auto
-    class ForceAnalysisDisplayMode(Enum):
-        OBJECT = auto()
-        CENTER_OF_MASS = auto()
-    print("Warning: Could not import ForceAnalysisDisplayMode from main_window, using local definition.")
+from .enums import ForceAnalysisDisplayMode # Import from new enums file
 
 
 if TYPE_CHECKING:
@@ -282,6 +270,37 @@ class RendererSystem(System):
 
             painter.restore() # Restore painter state for this entity
 
+        # --- Render Axis Connection Anchors ---
+        # Draw a small marker on dynamic objects at their connection point to an axis
+        axis_anchor_pen = QPen(QColor(255, 165, 0, 200)) # Orange, slightly transparent
+        axis_anchor_radius_world = 0.05 # Small radius for the anchor point marker
+        axis_anchor_pen.setWidthF(1.0 / pixels_per_world_unit if pixels_per_world_unit > 0 else 1.0)
+        
+        all_connections_for_anchors = self.entity_manager.get_all_independent_components_of_type(ConnectionComponent)
+        for conn_comp_anchor in all_connections_for_anchors:
+            if conn_comp_anchor.connection_type == ConnectionType.REVOLUTE_JOINT and not conn_comp_anchor.is_broken: # Changed to REVOLUTE_JOINT
+                # For a REVOLUTE_JOINT, both source_entity_id and target_entity_id are dynamic bodies.
+                # We want to draw an anchor marker on both at their respective connection_point_a and connection_point_b.
+                
+                entities_and_local_anchors = [
+                    (conn_comp_anchor.source_entity_id, conn_comp_anchor.connection_point_a),
+                    (conn_comp_anchor.target_entity_id, conn_comp_anchor.connection_point_b)
+                ]
+                
+                for dynamic_entity_id, local_anchor in entities_and_local_anchors:
+                    dynamic_transform = self.entity_manager.get_component(dynamic_entity_id, TransformComponent)
+                    if dynamic_transform:
+                        # local_anchor is already the correct local point for this entity
+                        world_anchor = dynamic_transform.position + local_anchor.rotate(dynamic_transform.angle)
+                        
+                        painter.save()
+                        painter.setPen(axis_anchor_pen) # Using the same pen as before
+                        painter.drawEllipse(QPointF(world_anchor.x, world_anchor.y), axis_anchor_radius_world, axis_anchor_radius_world)
+                        painter.restore()
+            # REMOVED elif for REVOLUTE_JOINT_AXIS as the enum member is gone.
+            # elif conn_comp_anchor.connection_type == ConnectionType.REVOLUTE_JOINT_AXIS and not conn_comp_anchor.is_broken:
+            #     ... old logic ...
+
         # --- Render Springs ---
         # This should be done after all entities are drawn, so springs appear on top or as defined by their own z-order (if implemented)
         # The painter's transform is currently reset after each entity. 
@@ -333,7 +352,7 @@ class RendererSystem(System):
         # Iterate through all independent ConnectionComponents
         all_connections = self.entity_manager.get_all_independent_components_of_type(ConnectionComponent)
 
-        rod_pen = QPen(QColor(100, 100, 100, 200)) # Dark Gray for rods
+        rod_pen = QPen(QColor(0, 0, 255, 200)) # Blue for rods
         rod_pen_width_pixels = 2.0
         rod_pen.setWidthF(rod_pen_width_pixels / pixels_per_world_unit if pixels_per_world_unit > 0 else rod_pen_width_pixels)
         
@@ -412,8 +431,18 @@ class RendererSystem(System):
         if force_analysis_target_entity_id is not None:
             target_transform = self.entity_manager.get_component(force_analysis_target_entity_id, TransformComponent)
             target_accumulator = self.entity_manager.get_component(force_analysis_target_entity_id, ForceAccumulatorComponent)
+            
+
 
             if target_transform and target_accumulator and target_accumulator.detailed_forces:
+                # print(f"DEBUG_RENDER_FORCES: Rendering force analysis for entity: {force_analysis_target_entity_id}") # LOG
+                # print(f"DEBUG_RENDER_FORCES: Entity {force_analysis_target_entity_id} detailed_forces: {target_accumulator.detailed_forces}") # LOG
+                # DEBUG LOG START: RendererSystem - Force Analysis detailed_forces (REMOVED)
+                # print(f"[DEBUG RendererSystem] Rendering force analysis for entity: {force_analysis_target_entity_id}")
+                # print(f"  ForceAccumulator.detailed_forces ({len(target_accumulator.detailed_forces)} items):")
+                # for i, f_detail in enumerate(target_accumulator.detailed_forces):
+                #     print(f"    Item {i}: Label='{f_detail.force_type_label}', Vector={f_detail.force_vector}, AppPointLocal={f_detail.application_point_local}")
+                # DEBUG LOG END
                 painter.save()
                 # Ensure painter is in the correct world transform state (it should be if called after entity loop)
                 # Set default pen/brush for force vectors
@@ -427,7 +456,7 @@ class RendererSystem(System):
                 world_units_per_newton = (force_scale_pixels / force_scale_reference / pixels_per_world_unit) \
                                          if force_scale_reference > 0 and pixels_per_world_unit > 0 else 0
 
-                for force_detail in target_accumulator.detailed_forces:
+                for i, force_detail in enumerate(target_accumulator.detailed_forces):
                     force_vec = force_detail.force_vector
                     force_magnitude = force_vec.magnitude()
                     if force_magnitude < 1e-6: # Skip zero forces
@@ -510,33 +539,15 @@ class RendererSystem(System):
         # painter.save() # REMOVED: Save/restore should bracket the specific state changes needed for text
 
         # --- Calculate Label Position ---
-        # Calculate a position slightly offset from the arrow end, perpendicular to the arrow direction.
-        label_offset_world_dist = 0.15 # Offset distance in world units (adjust as needed)
-        label_screen_offset_pixels = 5 # Additional small pixel offset for readability
-
+        # Position the label at the midpoint of the force vector.
         arrow_vector = end_pos - start_pos
-        if arrow_vector.magnitude_squared() > 1e-9:
-            direction = arrow_vector.normalize()
-            # Perpendicular direction (rotate 90 degrees counter-clockwise for offset 'above' the arrow end)
-            perp_direction = Vector2D(-direction.y, direction.x)
-            label_world_pos = end_pos + perp_direction * label_offset_world_dist
-        else:
-            # Fallback if arrow is zero length: place label slightly above start point
-            label_world_pos = start_pos + Vector2D(0, label_offset_world_dist) # Offset vertically
+        label_world_pos = start_pos + arrow_vector * 0.5
 
-        # Convert the calculated world position to screen coordinates (Y-down)
-        label_screen_pos = drawing_widget_ref.world_to_screen(label_world_pos) \
-                           if drawing_widget_ref and hasattr(drawing_widget_ref, 'world_to_screen') \
-                           else QPointF(end_pos.x, end_pos.y) # Fallback to end_pos if conversion fails
-
-        # Apply additional small screen offset for better spacing from the arrow tip
-        label_screen_pos += QPointF(label_screen_offset_pixels, -label_screen_offset_pixels) # Offset right and up in screen coords
-
+        # Small screen offset to avoid drawing text directly on top of the arrow line
+        label_screen_offset_x_pixels = 3
+        label_screen_offset_y_pixels = -7 # Offset upwards from the line
 
         # --- Draw Text ---
-        # Draw text at the calculated world position, but scale painter temporarily
-        # to achieve a fixed screen size for the font.
-
         painter.save() # Save state before text drawing modifications
 
         # Set font and color
@@ -546,18 +557,22 @@ class RendererSystem(System):
         painter.setPen(QColor(0, 0, 139)) # Dark Blue
 
         # Temporarily adjust painter transform for text drawing
+        # We want to draw text at a fixed pixel offset from the label_world_pos in screen space,
+        # but the text itself should be rendered with consistent size regardless of world zoom.
         painter.save() # Save transform state
-        painter.translate(label_world_pos.x, label_world_pos.y) # Move origin to label's world position
-        painter.scale(1.0 / scale, -1.0 / scale) # Undo world scale and Y-flip
+        
+        # Translate to the label's world position
+        painter.translate(label_world_pos.x, label_world_pos.y)
+        # Undo world scale and Y-flip to draw in screen-like pixel space relative to label_world_pos
+        painter.scale(1.0 / scale, -1.0 / scale)
+        
+        # Draw text at the desired pixel offset from the (now) origin
+        painter.drawText(QPointF(label_screen_offset_x_pixels, label_screen_offset_y_pixels), label)
+        
+        painter.restore() # Restore transform state (removes translate and scale for text)
 
-        # Draw text at the new origin (0,0) with a small pixel offset
-        # Note: label_screen_offset_pixels is used here for slight adjustment in the unscaled space
-        painter.drawText(QPointF(label_screen_offset_pixels, label_screen_offset_pixels), label) # Offset slightly right and down
-
-        painter.restore() # Restore transform state
-
-        # Restore font/pen state
-        painter.restore() # Matches the save before text drawing modifications
+        # Restore font/pen state (matches painter.save() before text_font settings)
+        painter.restore()
 
         # The final painter.restore() matches the save at the very beginning of _draw_force_vector
         # Ensure this final restore exists and is not commented out.

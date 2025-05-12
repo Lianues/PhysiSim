@@ -548,6 +548,122 @@ class SceneSerializer:
         
         return new_entity_id # Returning the UUID object
 
+    def serialize_object_group_to_preset_data(
+        self,
+        entity_ids: List[UUID],
+        connection_ids: List[UUID],
+        entity_manager: EntityManager,
+        group_anchor_world_pos: Vector2D
+    ) -> Dict[str, Any]:
+        """
+        Serializes a group of selected entities and their relevant connections into a dictionary
+        suitable for a composite preset.
+        Entities' positions are stored relative to the group_anchor_world_pos.
+        Entity IDs within the preset are local to the preset.
+        """
+        preset_data: Dict[str, Any] = {
+            "preset_type": "group", # Indicates a group preset
+            "entities": [],
+            "connections": []
+        }
+        
+        local_id_map: Dict[UUID, int] = {entity_id: i for i, entity_id in enumerate(entity_ids)}
+        
+        # Serialize entities
+        for original_entity_id in entity_ids:
+            if original_entity_id not in entity_manager.entities:
+                print(f"Warning: Entity '{original_entity_id}' not found in EntityManager during group preset serialization. Skipping.")
+                continue
+
+            local_entity_id = local_id_map[original_entity_id]
+            entity_preset_data = {
+                "local_id": local_entity_id,
+                "components": []
+            }
+            
+            components_for_entity = entity_manager.get_all_components_for_entity(original_entity_id)
+            if components_for_entity:
+                for component_instance in components_for_entity.values():
+                    # Skip serializing ConnectionComponents here as they are handled separately
+                    # to ensure their entity references are correctly mapped to local IDs.
+                    if isinstance(component_instance, components_module.ConnectionComponent):
+                        continue
+
+                    component_dict = self._component_to_dict(component_instance)
+
+                    if isinstance(component_instance, TransformComponent):
+                        if 'data' in component_dict and isinstance(component_dict['data'], dict) and \
+                           'position' in component_dict['data'] and isinstance(component_dict['data']['position'], dict) and \
+                           'x' in component_dict['data']['position'] and 'y' in component_dict['data']['position']:
+                            
+                            original_world_pos = Vector2D(
+                                component_dict['data']['position']['x'],
+                                component_dict['data']['position']['y']
+                            )
+                            relative_pos = original_world_pos - group_anchor_world_pos
+                            component_dict['data']['position'] = relative_pos.to_dict()
+                        else:
+                            print(f"Warning: Could not find or parse position for TransformComponent of entity {original_entity_id} during group preset serialization.")
+                    
+                    entity_preset_data["components"].append(component_dict)
+            
+            preset_data["entities"].append(entity_preset_data)
+
+        # Serialize connections using the provided connection_ids (UUIDs of ConnectionComponent instances)
+        all_connection_components_in_scene = entity_manager.get_all_independent_components_of_type(components_module.ConnectionComponent)
+        
+        for conn_id_to_find in connection_ids:
+            conn_comp_instance_to_serialize: Optional[components_module.ConnectionComponent] = None
+            for conn_comp in all_connection_components_in_scene:
+                # ConnectionComponent has an 'id' field which is its own UUID
+                if hasattr(conn_comp, 'id') and conn_comp.id == conn_id_to_find:
+                    conn_comp_instance_to_serialize = cast(components_module.ConnectionComponent, conn_comp)
+                    break
+            
+            if not conn_comp_instance_to_serialize:
+                print(f"Warning: ConnectionComponent with ID '{conn_id_to_find}' not found in EntityManager. Skipping for preset.")
+                continue
+
+            # Ensure both entities of the connection are part of the selected group
+            source_entity_uuid = conn_comp_instance_to_serialize.source_entity_id # Changed attribute name
+            target_entity_uuid = conn_comp_instance_to_serialize.target_entity_id # Changed attribute name
+
+            if source_entity_uuid not in local_id_map or target_entity_uuid not in local_id_map:
+                print(f"Warning: ConnectionComponent (ID: {conn_id_to_find}) links to one or more entities "
+                      f"not in the selected group ({source_entity_uuid}, {target_entity_uuid}). Skipping.")
+                continue
+
+            conn_serialized_data_full = self._component_to_dict(conn_comp_instance_to_serialize)
+            
+            # We need the 'data' part of the serialized component
+            if 'data' in conn_serialized_data_full and isinstance(conn_serialized_data_full['data'], dict):
+                conn_data_to_modify = conn_serialized_data_full['data']
+                
+                # Remap source_entity_id and target_entity_id to local integer IDs
+                # _component_to_dict already converts UUIDs to strings.
+                original_source_uuid_str = conn_data_to_modify.get('source_entity_id') # Changed key
+                original_target_uuid_str = conn_data_to_modify.get('target_entity_id') # Changed key
+
+                if original_source_uuid_str and original_target_uuid_str:
+                    try:
+                        # These were already asserted to be in local_id_map
+                        conn_data_to_modify['source_entity_id'] = local_id_map[UUID(original_source_uuid_str)] # Changed key
+                        conn_data_to_modify['target_entity_id'] = local_id_map[UUID(original_target_uuid_str)] # Changed key
+                        
+                        # Add the modified 'data' part to the preset's connections list
+                        preset_data["connections"].append(conn_data_to_modify)
+                    except ValueError:
+                        print(f"Warning: Could not parse UUIDs for ConnectionComponent "
+                              f"(ID: {conn_comp_instance_to_serialize.id}). Skipping.")
+                    except KeyError as e:
+                        print(f"Warning: Entity ID from ConnectionComponent {conn_comp_instance_to_serialize.id} not in local_id_map: {e}. Skipping.")
+                else:
+                    print(f"Warning: ConnectionComponent (ID: {conn_comp_instance_to_serialize.id}) "
+                          f"missing source_entity_id or target_entity_id in serialized data. Skipping.") # Changed message
+            else:
+                print(f"Warning: Serialized data for ConnectionComponent (ID: {conn_comp_instance_to_serialize.id}) is malformed. Skipping.")
+                      
+        return preset_data
 
 def register_all_components():
     """

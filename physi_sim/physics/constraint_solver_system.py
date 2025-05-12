@@ -20,19 +20,21 @@ class ConstraintSolverSystem(System):
     Solves physics constraints using Lagrange multipliers (e.g., for rods).
     This system calculates the necessary accelerations to satisfy constraints.
     """
-    def __init__(self, entity_manager: EntityManager, baumgarte_alpha: float = 20.0, baumgarte_beta: float = 2.0):
+    def __init__(self, entity_manager: EntityManager,
+                 baumgarte_pos_correction_factor: float = 0.2,
+                 baumgarte_vel_correction_factor: float = 0.8): # Renamed and new defaults
         """
         Initializes the ConstraintSolverSystem.
 
         Args:
             entity_manager: The entity manager instance.
-            baumgarte_alpha: Proportional gain for Baumgarte stabilization (position error).
-            baumgarte_beta: Derivative gain for Baumgarte stabilization (velocity error).
+            baumgarte_pos_correction_factor: Dimensionless factor for Baumgarte position stabilization (e.g., 0.1-0.8). Effective alpha = factor/dt.
+            baumgarte_vel_correction_factor: Dimensionless factor for Baumgarte velocity stabilization (e.g., 0.1-1.0). Effective beta = factor (or factor/dt).
         """
         super().__init__(entity_manager)
-        self.baumgarte_alpha = baumgarte_alpha
-        self.baumgarte_beta = baumgarte_beta
-        # print(f"ConstraintSolverSystem initialized with alpha={self.baumgarte_alpha}, beta={self.baumgarte_beta}")
+        self.baumgarte_pos_correction_factor = baumgarte_pos_correction_factor
+        self.baumgarte_vel_correction_factor = baumgarte_vel_correction_factor
+        # # print(f"ConstraintSolverSystem initialized with pos_factor={self.baumgarte_pos_correction_factor}, vel_factor={self.baumgarte_vel_correction_factor}")
 
     def _get_rotation_matrix(self, angle_rad: float) -> np.ndarray:
         """Helper to get a 2D rotation matrix."""
@@ -44,7 +46,8 @@ class ConstraintSolverSystem(System):
         self,
         dt: float,
         all_entity_ids_with_physics: List[str], # IDs of all entities with physics body (dynamic or fixed)
-        external_forces_torques: Dict[str, Tuple[Vector2D, float]] # {entity_id: (F_ext, τ_ext)}
+        external_forces_torques: Dict[str, Tuple[Vector2D, float]], # {entity_id: (F_ext, τ_ext)}
+        apply_and_record_constraint_forces: bool = True # New parameter
     ) -> Dict[str, Tuple[Vector2D, float]]: # {entity_id: (constrained_accel, constrained_angular_accel)}
         """
         Identifies active constraints, builds and solves the global KKT system,
@@ -72,19 +75,25 @@ class ConstraintSolverSystem(System):
         for conn in all_connections:
             is_rod = conn.connection_type == ConnectionType.ROD
             is_rope = conn.connection_type == ConnectionType.ROPE
+            is_revolute_joint = conn.connection_type == ConnectionType.REVOLUTE_JOINT
             
-            if (is_rod or is_rope) and not conn.is_broken:
+            if (is_rod or is_rope or is_revolute_joint) and not conn.is_broken:
                 # Common logic for fetching entity data
                 valid_connection = True
                 temp_entity_data_to_add = {}
                 temp_constrained_bodies_to_add = set()
 
-                for entity_id in [conn.source_entity_id, conn.target_entity_id]:
+                entities_to_check = []
+                if is_rod or is_rope or is_revolute_joint: # All these are two-body connections
+                    entities_to_check = [conn.source_entity_id, conn.target_entity_id]
+
+                for entity_id in entities_to_check:
                     if entity_id not in entity_data_map:
                         transform = self.entity_manager.get_component(entity_id, TransformComponent)
                         physics_body = self.entity_manager.get_component(entity_id, PhysicsBodyComponent)
                         if transform and physics_body:
                             temp_entity_data_to_add[entity_id] = {'transform': transform, 'physics': physics_body}
+                            # For axis joint, the axis itself is fixed, but still part of the "constrained bodies" concept
                             temp_constrained_bodies_to_add.add(entity_id)
                         else:
                             print(f"Warning: Connection {conn.id} ({conn.connection_type.name}) involves entity {entity_id} missing Transform or PhysicsBody. Skipping constraint.")
@@ -100,10 +109,31 @@ class ConstraintSolverSystem(System):
                          entity_data_map[eid] = data
                 constrained_bodies_set.update(temp_constrained_bodies_to_add)
 
-                # Constraint-specific activation logic
+                # Constraint-specific activation logic & validation
                 if is_rod:
                     active_constraints.append(conn)
-                elif is_rope:
+                elif is_revolute_joint:
+                    # print(f"[CSS_DEBUG] Found REVOLUTE_JOINT: {conn.id}, Source: {conn.source_entity_id}, Target: {conn.target_entity_id}")
+                    # For REVOLUTE_JOINT, both source and target are typically dynamic, or one could be fixed.
+                    # The constraint itself doesn't impose one being an "axis entity".
+                    source_physics = entity_data_map[conn.source_entity_id]['physics']
+                    target_physics = entity_data_map[conn.target_entity_id]['physics'] # Axis entity
+
+                    if source_physics.is_fixed:
+                        print(f"[CSS_DEBUG] Axis joint {conn.id} source entity {conn.source_entity_id} (dynamic part) IS FIXED. Skipping constraint.")
+                        valid_connection = False
+                    
+                    # If both are fixed, it's also not a dynamic constraint we handle here.
+                    if source_physics.is_fixed and target_physics.is_fixed:
+                         print(f"[CSS_DEBUG] Axis joint {conn.id} connects two fixed bodies ({conn.source_entity_id} and {conn.target_entity_id}). Skipping.")
+                         valid_connection = False
+                    
+                    if valid_connection:
+                        # print(f"[CSS_DEBUG] Axis joint {conn.id} is considered for active_constraints. Source fixed: {source_physics.is_fixed}, Target (Axis) fixed: {target_physics.is_fixed}")
+                        active_constraints.append(conn)
+                    else:
+                        print(f"[CSS_DEBUG] Axis joint {conn.id} IS INVALID and skipped.")
+                elif is_rope: # Keep rope logic after axis joint, as it might share some initial checks
                     natural_length = conn.parameters.get("natural_length")
                     if natural_length is None:
                         print(f"Warning: Rope connection {conn.id} missing 'natural_length' parameter. Skipping constraint.")
@@ -135,9 +165,9 @@ class ConstraintSolverSystem(System):
 
                     if current_length > natural_length + EPSILON:
                         active_constraints.append(conn)
-                        # print(f"[DEBUG_CONSTRAINTSOLVER] Rope {conn.id} activated. Current: {current_length:.3f}, Natural: {natural_length:.3f}")
+                        # # print(f"[DEBUG_CONSTRAINTSOLVER] Rope {conn.id} activated. Current: {current_length:.3f}, Natural: {natural_length:.3f}")
                     # else:
-                        # print(f"[DEBUG_CONSTRAINTSOLVER] Rope {conn.id} NOT activated. Current: {current_length:.3f}, Natural: {natural_length:.3f}")
+                        # # print(f"[DEBUG_CONSTRAINTSOLVER] Rope {conn.id} NOT activated. Current: {current_length:.3f}, Natural: {natural_length:.3f}")
 
 
         # Initialize result map with unconstrained accelerations for all physics entities
@@ -165,10 +195,10 @@ class ConstraintSolverSystem(System):
                 result_accelerations[entity_id] = (accel, angular_accel)
 
         if not active_constraints:
-            # print("[DEBUG_CONSTRAINTSOLVER] No active rod or rope constraints found.")
+            # # print("[DEBUG_CONSTRAINTSOLVER] No active constraints found.")
             return result_accelerations # Return unconstrained accelerations
-
-        # print(f"[DEBUG_CONSTRAINTSOLVER] Found {len(active_constraints)} active constraints (rod/rope).")
+        
+        # # print(f"[DEBUG_CONSTRAINTSOLVER] Found {len(active_constraints)} active constraints.")
 
         # 2. Identify unique DYNAMIC bodies involved in constraints for DoF allocation
         #    and create DoF mapping.
@@ -180,7 +210,7 @@ class ConstraintSolverSystem(System):
             # All constrained bodies are fixed, no dynamic DoFs to solve for.
             # This implies constraints are between fixed points, which are either trivially satisfied or violated.
             # No constraint forces are generated in a dynamic sense.
-            # print("[DEBUG_CONSTRAINTSOLVER] All constrained bodies are fixed. No dynamic DoFs.")
+            # # print("[DEBUG_CONSTRAINTSOLVER] All constrained bodies are fixed. No dynamic DoFs.")
             return result_accelerations # Accelerations are already set (0 for fixed, F/M for others)
 
 
@@ -225,14 +255,24 @@ class ConstraintSolverSystem(System):
         v_global_np = np.array(v_global_list)
         Global_F_ext_np = np.array(Global_F_ext_list)
 
-        # 4. Build Global J (N_constraints x N_dof) and Global b_stabilized (N_constraints x 1)
-        N_constraints = len(active_constraints)
-        Global_J = np.zeros((N_constraints, N_dof))
-        Global_b_stabilized = np.zeros(N_constraints)
+        # 4. Build Global J and Global b_stabilized
+        # N_scalar_constraints is the total number of scalar constraint equations
+        N_scalar_constraints = 0
+        for conn in active_constraints:
+            if conn.connection_type == ConnectionType.ROD or conn.connection_type == ConnectionType.ROPE:
+                N_scalar_constraints += 1
+            elif conn.connection_type == ConnectionType.REVOLUTE_JOINT:
+                N_scalar_constraints += 2 # 2 scalar constraints for a 2D revolute joint (dx=0, dy=0)
+        
+        Global_J = np.zeros((N_scalar_constraints, N_dof))
+        Global_b_stabilized = np.zeros(N_scalar_constraints)
+        
+        current_row_idx = 0 # Tracks the current row in Global_J and Global_b_stabilized
 
         # Loop through active_constraints to populate Global_J and Global_b_stabilized
-        for i_constraint, conn in enumerate(active_constraints):
+        for conn in active_constraints: # Removed i_constraint as we use current_row_idx
             id_a = conn.source_entity_id
+            # For axis joint, id_b is the axis (fixed). For others, it's the second dynamic body.
             id_b = conn.target_entity_id
             data_a = entity_data_map[id_a]
             data_b = entity_data_map[id_b]
@@ -254,126 +294,215 @@ class ConstraintSolverSystem(System):
             p_a_local = conn.connection_point_a
             p_b_local = conn.connection_point_b
             
-            if conn.connection_type == ConnectionType.ROD:
-                L = conn.parameters.get("target_length")
-                if L is None: # Should not happen if validation is done during creation
-                    print(f"Error: Rod {conn.id} missing 'target_length'. Skipping.")
-                    Global_b_stabilized[i_constraint] = 0 # Avoid issues
+            if conn.connection_type == ConnectionType.ROD or conn.connection_type == ConnectionType.ROPE:
+                L_param_name = "target_length" if conn.connection_type == ConnectionType.ROD else "natural_length"
+                L = conn.parameters.get(L_param_name)
+                if L is None:
+                    print(f"Error: {conn.connection_type.name} {conn.id} missing '{L_param_name}'. Skipping.")
+                    # Need to ensure current_row_idx is advanced if we skip, or handle this better.
+                    # For now, assume valid parameters from creation. If not, this could lead to issues.
+                    # A simple skip might misalign rows if not careful.
+                    # Let's assume for now that if L is None, the constraint was already filtered or this is an error.
+                    # To be safe, let's fill with zeros and advance.
+                    if N_dof > 0: # Only if there are dynamic DoFs to map to
+                         Global_J[current_row_idx, :] = 0
+                    Global_b_stabilized[current_row_idx] = 0
+                    current_row_idx += 1
                     continue
-            elif conn.connection_type == ConnectionType.ROPE:
-                L = conn.parameters.get("natural_length")
-                if L is None: # Should not happen if validation is done during creation
-                    print(f"Error: Rope {conn.id} missing 'natural_length'. Skipping.")
-                    Global_b_stabilized[i_constraint] = 0 # Avoid issues
-                    continue
-            else: # Should not happen as active_constraints only contains ROD/ROPE
-                print(f"Error: Unknown constraint type {conn.connection_type} for {conn.id}. Skipping.")
-                Global_b_stabilized[i_constraint] = 0
-                continue
 
 
-            # Rotation matrices (as numpy arrays)
-            R_a_np = self._get_rotation_matrix(theta_a)
-            R_b_np = self._get_rotation_matrix(theta_b)
+            # --- Common calculations for ROD, ROPE ---
+            if conn.connection_type == ConnectionType.ROD or conn.connection_type == ConnectionType.ROPE:
+                R_a_np = self._get_rotation_matrix(theta_a)
+                R_b_np = self._get_rotation_matrix(theta_b)
 
-            # World connection points (r_AP_world, r_BP_world) and vector d
-            r_AP_local_np = np.array([p_a_local.x, p_a_local.y])
-            r_AP_world_np = R_a_np @ r_AP_local_np
-            P_A_world = r_a + Vector2D(r_AP_world_np[0], r_AP_world_np[1])
+                r_AP_local_np = np.array([p_a_local.x, p_a_local.y])
+                r_AP_world_np = R_a_np @ r_AP_local_np
+                P_A_world = r_a + Vector2D(r_AP_world_np[0], r_AP_world_np[1])
 
-            r_BP_local_np = np.array([p_b_local.x, p_b_local.y])
-            r_BP_world_np = R_b_np @ r_BP_local_np
-            P_B_world = r_b + Vector2D(r_BP_world_np[0], r_BP_world_np[1])
+                r_BP_local_np = np.array([p_b_local.x, p_b_local.y])
+                r_BP_world_np = R_b_np @ r_BP_local_np
+                P_B_world = r_b + Vector2D(r_BP_world_np[0], r_BP_world_np[1])
+                
+                d_vec = P_B_world - P_A_world
+                
+                k_cross_r_AP_world = Vector2D(-r_AP_world_np[1], r_AP_world_np[0])
+                k_cross_r_BP_world = Vector2D(-r_BP_world_np[1], r_BP_world_np[0])
+
+                J_k_local_row_rodrope = np.zeros(6)
+                J_k_local_row_rodrope[0] = -2 * d_vec.x
+                J_k_local_row_rodrope[1] = -2 * d_vec.y
+                J_k_local_row_rodrope[2] = -2 * d_vec.dot(k_cross_r_AP_world)
+                J_k_local_row_rodrope[3] =  2 * d_vec.x
+                J_k_local_row_rodrope[4] =  2 * d_vec.y
+                J_k_local_row_rodrope[5] =  2 * d_vec.dot(k_cross_r_BP_world)
+
+                if not is_a_fixed:
+                    idx_a_start = entity_to_dof_start_idx[id_a]
+                    Global_J[current_row_idx, idx_a_start : idx_a_start+3] = J_k_local_row_rodrope[0:3]
+                if not is_b_fixed: # Should always be true for ROD/ROPE if it's dynamic
+                    idx_b_start = entity_to_dof_start_idx[id_b]
+                    Global_J[current_row_idx, idx_b_start : idx_b_start+3] = J_k_local_row_rodrope[3:6]
+
+                v_rel_P_term1 = v_b_eff - v_a_eff
+                v_rel_P_term2_A = k_cross_r_AP_world * omega_a_eff
+                v_rel_P_term2_B = k_cross_r_BP_world * omega_b_eff
+                v_rel_P = v_rel_P_term1 + (v_rel_P_term2_B - v_rel_P_term2_A)
+                term_v_sq = v_rel_P.dot(v_rel_P)
+                
+                omega_sq_r_A_term = Vector2D(r_AP_world_np[0], r_AP_world_np[1]) * (omega_a_eff**2)
+                omega_sq_r_B_term = Vector2D(r_BP_world_np[0], r_BP_world_np[1]) * (omega_b_eff**2)
+                term_omega_sq_r = d_vec.dot(omega_sq_r_B_term - omega_sq_r_A_term)
+                b_accel_k = -2 * (term_v_sq - term_omega_sq_r)
+                C_pos_k = d_vec.dot(d_vec) - L**2
+                Jv_k = Global_J[current_row_idx, :] @ v_global_np
+                
+                effective_alpha_pos = self.baumgarte_pos_correction_factor / dt if dt > EPSILON else self.baumgarte_pos_correction_factor * (1.0/0.016) # Avoid division by zero, use typical 1/dt
+                effective_beta_vel = self.baumgarte_vel_correction_factor / dt if dt > EPSILON else self.baumgarte_vel_correction_factor * (1.0/0.016) # Also scale beta by 1/dt
+
+                Global_b_stabilized[current_row_idx] = b_accel_k - effective_alpha_pos * C_pos_k - effective_beta_vel * Jv_k
+                current_row_idx += 1
+
+            elif conn.connection_type == ConnectionType.REVOLUTE_JOINT:
+                # Constraint: P_A_world(q_A) - P_B_world(q_B) = 0
+                # This means the connection points on body A and body B must coincide.
+                # P_A_world = r_A + R_A * p_A_local
+                # P_B_world = r_B + R_B * p_B_local
+                
+                id_A_dyn = conn.source_entity_id # Dynamic body
+                id_B_axis = conn.target_entity_id # Axis (can be dynamic or fixed)
+
+                data_A_dyn = entity_data_map[id_A_dyn]
+                data_B_axis = entity_data_map[id_B_axis]
+
+                is_B_axis_fixed = data_B_axis['physics'].is_fixed
+
+                pos_A = data_A_dyn['transform'].position
+                angle_A = data_A_dyn['transform'].angle
+                # vel_A and omega_A will be taken from v_global_np for Jv calculation
+                p_A_local = conn.connection_point_a
+
+                pos_B = data_B_axis['transform'].position
+                angle_B = data_B_axis['transform'].angle
+                # vel_B and omega_B if dynamic, else 0
+                omega_B_val = data_B_axis['physics'].angular_velocity if not is_B_axis_fixed else 0.0
+                p_B_local = conn.connection_point_b # Usually (0,0) for axis entity
+
+                # Calculate world offsets r_AP_world and r_BP_world
+                R_A_np = self._get_rotation_matrix(angle_A)
+                p_A_local_np = np.array([p_A_local.x, p_A_local.y])
+                r_AP_world_np = R_A_np @ p_A_local_np
+                r_AP_world = Vector2D(r_AP_world_np[0], r_AP_world_np[1])
+                P_A_world = pos_A + r_AP_world
+
+                R_B_np = self._get_rotation_matrix(angle_B)
+                p_B_local_np = np.array([p_B_local.x, p_B_local.y])
+                r_BP_world_np = R_B_np @ p_B_local_np
+                r_BP_world = Vector2D(r_BP_world_np[0], r_BP_world_np[1])
+                P_B_world = pos_B + r_BP_world
+
+                # Jacobian for body A (dynamic)
+                idx_A_start = entity_to_dof_start_idx[id_A_dyn]
+                Global_J[current_row_idx, idx_A_start : idx_A_start+3] = [1, 0, -r_AP_world.y]
+                Global_J[current_row_idx+1, idx_A_start : idx_A_start+3] = [0, 1, r_AP_world.x]
+                
+                # dJ/dt * v terms for body A (omega_A is from physics component, representing current state)
+                current_omega_A = data_A_dyn['physics'].angular_velocity
+                b_accel_A_x = current_omega_A**2 * r_AP_world.x
+                b_accel_A_y = current_omega_A**2 * r_AP_world.y
+                
+                # Positional error C_pos = P_A_world - P_B_world
+                C_pos_x = P_A_world.x - P_B_world.x
+                C_pos_y = P_A_world.y - P_B_world.y
+                
+                # Jv for body A part (using v_global_np which contains current velocities)
+                v_global_A_slice = v_global_np[idx_A_start : idx_A_start+3]
+                Jv_A_x = Global_J[current_row_idx, idx_A_start : idx_A_start+3] @ v_global_A_slice
+                Jv_A_y = Global_J[current_row_idx+1, idx_A_start : idx_A_start+3] @ v_global_A_slice
+
+                b_accel_x_total = b_accel_A_x
+                b_accel_y_total = b_accel_A_y
+                Jv_x_total = Jv_A_x
+                Jv_y_total = Jv_A_y
+
+                if not is_B_axis_fixed:
+                    # Axis B is dynamic, add its Jacobian and dJ/dt * v terms
+                    idx_B_start = entity_to_dof_start_idx[id_B_axis]
+                    Global_J[current_row_idx, idx_B_start : idx_B_start+3] = [-1, 0, r_BP_world.y]
+                    Global_J[current_row_idx+1, idx_B_start : idx_B_start+3] = [0, -1, -r_BP_world.x]
+                    
+                    current_omega_B = data_B_axis['physics'].angular_velocity
+                    b_accel_B_x = -(current_omega_B**2 * r_BP_world.x) # J_B part is -I, so d(J_B)/dt * v_B gives -(dI/dt * v_B) effectively
+                    b_accel_B_y = -(current_omega_B**2 * r_BP_world.y)
+                    b_accel_x_total += b_accel_B_x
+                    b_accel_y_total += b_accel_B_y
+                    
+                    v_global_B_slice = v_global_np[idx_B_start : idx_B_start+3]
+                    Jv_B_x = Global_J[current_row_idx, idx_B_start : idx_B_start+3] @ v_global_B_slice
+                    Jv_B_y = Global_J[current_row_idx+1, idx_B_start : idx_B_start+3] @ v_global_B_slice
+                    Jv_x_total += Jv_B_x
+                    Jv_y_total += Jv_B_y
+                effective_alpha_pos = self.baumgarte_pos_correction_factor / dt if dt > EPSILON else self.baumgarte_pos_correction_factor * (1.0/0.016)
+                effective_beta_vel = self.baumgarte_vel_correction_factor / dt if dt > EPSILON else self.baumgarte_vel_correction_factor * (1.0/0.016)
+                
+                Global_b_stabilized[current_row_idx]   = b_accel_x_total - effective_alpha_pos * C_pos_x - effective_beta_vel * Jv_x_total
+                Global_b_stabilized[current_row_idx+1] = b_accel_y_total - effective_alpha_pos * C_pos_y - effective_beta_vel * Jv_y_total
+                
+                current_row_idx += 2
             
-            d_vec = P_B_world - P_A_world # Vector2D
+            
+            else: # Should not happen if active_constraints only contains valid types
+                print(f"Error: Unknown or unhandled constraint type {conn.connection_type} for {conn.id} during Jacobian build. Skipping.")
+                # How many rows to advance current_row_idx depends on the unknown constraint.
+                # This indicates a logic error if reached.
+                # For safety, if it's a recognized ConnectionComponent, assume 1 or 2 rows based on typical constraint counts.
+                # However, this path should ideally not be taken.
+                # If it's truly unknown, we might not know how many rows it *should* have taken.
+                # Let's assume it's a single scalar constraint if we absolutely must guess.
+                # current_row_idx += 1 # This is risky.
+                pass # Or raise an error, as this means an unhandled constraint type made it this far.
 
-            # Local Jacobian components J_k_local (1x6 for the pair A,B)
-            # J_k_local = [J_Ax, J_Ay, J_Atheta, J_Bx, J_By, J_Btheta]
-            J_k_local_row = np.zeros(6)
-            
-            # r_AP_world_vec = Vector2D(r_AP_world_np[0], r_AP_world_np[1]) # Not needed directly for J, but for b_accel
-            # r_BP_world_vec = Vector2D(r_BP_world_np[0], r_BP_world_np[1])
-            
-            k_cross_r_AP_world = Vector2D(-r_AP_world_np[1], r_AP_world_np[0]) # k_hat x r_AP_world
-            k_cross_r_BP_world = Vector2D(-r_BP_world_np[1], r_BP_world_np[0]) # k_hat x r_BP_world
-
-            J_k_local_row[0] = -2 * d_vec.x
-            J_k_local_row[1] = -2 * d_vec.y
-            J_k_local_row[2] = -2 * d_vec.dot(k_cross_r_AP_world)
-            J_k_local_row[3] =  2 * d_vec.x
-            J_k_local_row[4] =  2 * d_vec.y
-            J_k_local_row[5] =  2 * d_vec.dot(k_cross_r_BP_world)
-
-            # Populate Global_J
-            if not is_a_fixed:
-                idx_a_start = entity_to_dof_start_idx[id_a]
-                Global_J[i_constraint, idx_a_start : idx_a_start+3] = J_k_local_row[0:3]
-            if not is_b_fixed:
-                idx_b_start = entity_to_dof_start_idx[id_b]
-                Global_J[i_constraint, idx_b_start : idx_b_start+3] = J_k_local_row[3:6]
-
-            # Calculate b_accel for this constraint
-            # v_rel_P = (v_B_eff - v_A_eff) + (ω_B_eff * k_hat × r_BP_world - ω_A_eff * k_hat × r_AP_world)
-            v_rel_P_term1 = v_b_eff - v_a_eff
-            v_rel_P_term2_A = k_cross_r_AP_world * omega_a_eff
-            v_rel_P_term2_B = k_cross_r_BP_world * omega_b_eff
-            v_rel_P = v_rel_P_term1 + (v_rel_P_term2_B - v_rel_P_term2_A)
-            
-            term_v_sq = v_rel_P.dot(v_rel_P)
-            
-            # d · (ω_B^2 r_BP_world - ω_A^2 r_AP_world)
-            omega_sq_r_A_term = Vector2D(r_AP_world_np[0], r_AP_world_np[1]) * (omega_a_eff**2)
-            omega_sq_r_B_term = Vector2D(r_BP_world_np[0], r_BP_world_np[1]) * (omega_b_eff**2)
-            term_omega_sq_r = d_vec.dot(omega_sq_r_B_term - omega_sq_r_A_term)
-            
-            b_accel_k = -2 * (term_v_sq - term_omega_sq_r)
-
-            # Baumgarte Stabilization terms for this constraint
-            C_pos_k = d_vec.dot(d_vec) - L**2
-            
-            # Jv_k = J_k_global_row @ v_global_np
-            # J_k_global_row is Global_J[i_constraint,:]
-            Jv_k = Global_J[i_constraint, :] @ v_global_np
-            
-            Global_b_stabilized[i_constraint] = b_accel_k - self.baumgarte_alpha * C_pos_k - self.baumgarte_beta * Jv_k
-
-        # print(f"[DEBUG_CONSTRAINTSOLVER] Global_J and Global_b_stabilized populated.")
-        # print(f"[DEBUG_CONSTRAINTSOLVER] Global_J:\n{Global_J}")
-        # print(f"[DEBUG_CONSTRAINTSOLVER] Global_b_stabilized:\n{Global_b_stabilized}")
+        # # print(f"[DEBUG_CONSTRAINTSOLVER] Global_J and Global_b_stabilized populated.")
+        # # print(f"[DEBUG_CONSTRAINTSOLVER] Global_J:\n{Global_J}")
+        # # print(f"[DEBUG_CONSTRAINTSOLVER] Global_b_stabilized:\n{Global_b_stabilized}")
 
         # 5. Solve the global KKT system
         # [ Global_M   Global_J^T ] [ dv_dt_global ] = [ Global_F_ext        ]
         # [ Global_J    0         ] [ lambda_global] = [ Global_b_stabilized ]
         
         dv_dt_global_np = np.zeros(N_dof) # Initialize to zeros
-        lambda_global_np = np.zeros(N_constraints) # Initialize to zeros
+        lambda_global_np = np.zeros(N_scalar_constraints) # Lambdas match scalar constraints
 
         if N_dof > 0 : # Only solve if there are dynamic degrees of freedom
-            KKT_size = N_dof + N_constraints
+            KKT_size = N_dof + N_scalar_constraints
             Global_KKT_matrix = np.zeros((KKT_size, KKT_size))
             
             # Top-left: Global_M (N_dof x N_dof)
             Global_KKT_matrix[0:N_dof, 0:N_dof] = Global_M
-            # Top-right: Global_J^T (N_dof x N_constraints)
+            # Top-right: Global_J^T (N_dof x N_scalar_constraints)
             Global_KKT_matrix[0:N_dof, N_dof:KKT_size] = Global_J.T
-            # Bottom-left: Global_J (N_constraints x N_dof)
+            # Bottom-left: Global_J (N_scalar_constraints x N_dof)
             Global_KKT_matrix[N_dof:KKT_size, 0:N_dof] = Global_J
-            # Bottom-right block (N_constraints x N_constraints) is zero for ideal constraints
+            # Bottom-right block (N_scalar_constraints x N_scalar_constraints) is zero for ideal constraints
 
             Global_rhs = np.zeros(KKT_size)
             Global_rhs[0:N_dof] = Global_F_ext_np
             Global_rhs[N_dof:KKT_size] = Global_b_stabilized
 
             try:
-                # print(f"[DEBUG_CONSTRAINTSOLVER] Attempting to solve KKT system of size {KKT_size}x{KKT_size}")
-                # print(f"[DEBUG_CONSTRAINTSOLVER] KKT Matrix:\n{Global_KKT_matrix}")
-                # print(f"[DEBUG_CONSTRAINTSOLVER] RHS Vector:\n{Global_rhs}")
-                solution_global = np.linalg.solve(Global_KKT_matrix, Global_rhs)
+                # # print(f"[DEBUG_CONSTRAINTSOLVER] Attempting to solve KKT system of size {KKT_size}x{KKT_size}")
+                # # print(f"[DEBUG_CONSTRAINTSOLVER] KKT Matrix:\n{Global_KKT_matrix}")
+                # # print(f"[DEBUG_CONSTRAINTSOLVER] RHS Vector:\n{Global_rhs}")
+                # Use lstsq for more robustness against singular matrices
+                solution_global, residuals, rank, s = np.linalg.lstsq(Global_KKT_matrix, Global_rhs, rcond=None)
+                if rank < KKT_size:
+                    print(f"Warning: KKT matrix is rank deficient (rank {rank} for size {KKT_size}). Solution may not be unique or exact.")
+
                 dv_dt_global_np = solution_global[0:N_dof]
                 lambda_global_np = solution_global[N_dof:KKT_size]
-                # print(f"[DEBUG_CONSTRAINTSOLVER] KKT system solved.")
-                # print(f"[DEBUG_CONSTRAINTSOLVER] dv_dt_global_np:\n{dv_dt_global_np}")
-                # print(f"[DEBUG_CONSTRAINTSOLVER] lambda_global_np:\n{lambda_global_np}")
+                # # print(f"[DEBUG_CONSTRAINTSOLVER] KKT system solved.")
+                # # print(f"[DEBUG_CONSTRAINTSOLVER] dv_dt_global_np:\n{dv_dt_global_np}")
+                # # print(f"[DEBUG_CONSTRAINTSOLVER] lambda_global_np:\n{lambda_global_np}")
 
             except np.linalg.LinAlgError as e:
                 print(f"Error: Global KKT system solve failed: {e}")
@@ -395,85 +524,152 @@ class ConstraintSolverSystem(System):
         # result_accelerations already contains 0 accel for fixed, and F/M for unconstrained dynamic.
 
         # 7. Record detailed constraint forces for visualization/debugging
-        if N_constraints > 0 and np.any(lambda_global_np): # Only if there are lambdas to process
-            # print(f"[DEBUG_CONSTRAINTSOLVER] Recording detailed constraint forces. Lambdas: {lambda_global_np}")
-            for k_constraint_idx, conn_k in enumerate(active_constraints):
-                lambda_k_val = lambda_global_np[k_constraint_idx]
-                lambda_k_val = -lambda_k_val # 全局符号反转 (恢复)
-                
-                # After flipping lambda_k_val, for a rope:
-                # - If original lambda was positive (tension), flipped lambda_k_val is now negative. This is the valid tension case.
-                # - If original lambda was negative (compression, not possible for rope), flipped lambda_k_val is now positive. Rope should be slack.
-                if conn_k.connection_type == ConnectionType.ROPE and lambda_k_val > EPSILON: # Check if flipped lambda indicates original compression
-                    # print(f"[DEBUG_CONSTRAINTSOLVER] Rope {conn_k.id} (flipped lambda_k_val {lambda_k_val:.4f} > 0) wants to push. Setting to 0 (slack).")
-                    lambda_k_val = 0.0 # Rope cannot push, so set its force to zero.
-
-                if abs(lambda_k_val) < EPSILON: # Skip if lambda is negligible (or was set to 0 for slack rope)
-                    continue
-
+        if apply_and_record_constraint_forces and N_scalar_constraints > 0 and np.any(lambda_global_np): # Check new flag
+            # # print(f"[DEBUG_CONSTRAINTSOLVER] Recording detailed constraint forces. Lambdas: {lambda_global_np}")
+            
+            processed_lambda_idx = 0 # Tracks which lambda(s) we are processing from lambda_global_np
+            for conn_k in active_constraints:
                 id_a = conn_k.source_entity_id
-                id_b = conn_k.target_entity_id
+                id_b = conn_k.target_entity_id # Axis for REVOLUTE_JOINT_AXIS, other body for ROD/ROPE
                 data_a = entity_data_map[id_a]
-                data_b = entity_data_map[id_b]
                 p_a_local = conn_k.connection_point_a
-                p_b_local = conn_k.connection_point_b
+                
+                if conn_k.connection_type == ConnectionType.ROD or conn_k.connection_type == ConnectionType.ROPE:
+                    lambda_k_val = lambda_global_np[processed_lambda_idx]
+                    lambda_k_val = -lambda_k_val # Sign convention
+                    processed_lambda_idx += 1
 
-                # Recompute J_k_local (1x6) for this constraint
-                # This is needed because Global_J might only contain parts for dynamic bodies,
-                # but for force calculation, we need the full local Jacobian.
-                # (Code for P_A_world, P_B_world, d_vec, r_AP_world_np, r_BP_world_np, k_cross_r_AP_world, k_cross_r_BP_world)
-                # This re-calculation is a bit redundant if values were cached during Global_J build.
-                # For now, explicit re-calculation for clarity:
-                r_a = data_a['transform'].position; theta_a = data_a['transform'].angle
-                r_b = data_b['transform'].position; theta_b = data_b['transform'].angle
-                R_a_np_fc = self._get_rotation_matrix(theta_a) # Suffix _fc for force calculation
-                R_b_np_fc = self._get_rotation_matrix(theta_b)
-                r_AP_local_np_fc = np.array([p_a_local.x, p_a_local.y])
-                r_AP_world_np_fc = R_a_np_fc @ r_AP_local_np_fc
-                P_A_world_fc = r_a + Vector2D(r_AP_world_np_fc[0], r_AP_world_np_fc[1])
-                r_BP_local_np_fc = np.array([p_b_local.x, p_b_local.y])
-                r_BP_world_np_fc = R_b_np_fc @ r_BP_local_np_fc
-                P_B_world_fc = r_b + Vector2D(r_BP_world_np_fc[0], r_BP_world_np_fc[1])
-                d_vec_fc = P_B_world_fc - P_A_world_fc
-                k_cross_r_AP_world_fc = Vector2D(-r_AP_world_np_fc[1], r_AP_world_np_fc[0])
-                k_cross_r_BP_world_fc = Vector2D(-r_BP_world_np_fc[1], r_BP_world_np_fc[0])
+                    if conn_k.connection_type == ConnectionType.ROPE and lambda_k_val > EPSILON:
+                        lambda_k_val = 0.0
+                    if abs(lambda_k_val) < EPSILON:
+                        continue
 
-                J_k_local_for_force = np.zeros(6)
-                J_k_local_for_force[0] = -2 * d_vec_fc.x
-                J_k_local_for_force[1] = -2 * d_vec_fc.y
-                J_k_local_for_force[2] = -2 * d_vec_fc.dot(k_cross_r_AP_world_fc)
-                J_k_local_for_force[3] =  2 * d_vec_fc.x
-                J_k_local_for_force[4] =  2 * d_vec_fc.y
-                J_k_local_for_force[5] =  2 * d_vec_fc.dot(k_cross_r_BP_world_fc)
+                    data_b = entity_data_map[id_b] # Second dynamic body
+                    p_b_local = conn_k.connection_point_b
+                    
+                    r_a = data_a['transform'].position; theta_a = data_a['transform'].angle
+                    r_b = data_b['transform'].position; theta_b = data_b['transform'].angle
+                    R_a_np_fc = self._get_rotation_matrix(theta_a)
+                    R_b_np_fc = self._get_rotation_matrix(theta_b)
+                    r_AP_local_np_fc = np.array([p_a_local.x, p_a_local.y])
+                    r_AP_world_np_fc = R_a_np_fc @ r_AP_local_np_fc
+                    P_A_world_fc = r_a + Vector2D(r_AP_world_np_fc[0], r_AP_world_np_fc[1])
+                    r_BP_local_np_fc = np.array([p_b_local.x, p_b_local.y])
+                    r_BP_world_np_fc = R_b_np_fc @ r_BP_local_np_fc
+                    P_B_world_fc = r_b + Vector2D(r_BP_world_np_fc[0], r_BP_world_np_fc[1])
+                    d_vec_fc = P_B_world_fc - P_A_world_fc
+                    k_cross_r_AP_world_fc = Vector2D(-r_AP_world_np_fc[1], r_AP_world_np_fc[0])
+                    k_cross_r_BP_world_fc = Vector2D(-r_BP_world_np_fc[1], r_BP_world_np_fc[0])
 
-                # Generalized force from this constraint: f_k_gen = J_k_local^T * lambda_k
-                f_k_gen = J_k_local_for_force.T * lambda_k_val
-
-                # Force on A from this constraint k
-                force_on_A_k = Vector2D(f_k_gen[0], f_k_gen[1])
-                # Torque on A: tau_A_k = f_k_gen[2] (not directly used by record_force_detail for linear force)
-                acc_a = self.entity_manager.get_component(id_a, ForceAccumulatorComponent)
-                if acc_a:
+                    J_k_local_for_force_rodrope = np.zeros(6)
+                    J_k_local_for_force_rodrope[0] = -2 * d_vec_fc.x
+                    J_k_local_for_force_rodrope[1] = -2 * d_vec_fc.y
+                    J_k_local_for_force_rodrope[2] = -2 * d_vec_fc.dot(k_cross_r_AP_world_fc)
+                    J_k_local_for_force_rodrope[3] =  2 * d_vec_fc.x
+                    J_k_local_for_force_rodrope[4] =  2 * d_vec_fc.y
+                    J_k_local_for_force_rodrope[5] =  2 * d_vec_fc.dot(k_cross_r_BP_world_fc)
+                    
+                    f_k_gen = J_k_local_for_force_rodrope.T * lambda_k_val
                     force_label_prefix = "CRod" if conn_k.connection_type == ConnectionType.ROD else "RopeTension"
-                    acc_a.record_force_detail(
-                        force_vector=force_on_A_k,
-                        application_point_local=p_a_local,
-                        force_type_label=f"{force_label_prefix}_{conn_k.id.hex[:4]}_{id_a.hex[:4]}",
-                        is_visualization_only=True
-                    )
 
-                # Force on B from this constraint k
-                force_on_B_k = Vector2D(f_k_gen[3], f_k_gen[4])
-                # Torque on B: tau_B_k = f_k_gen[5]
-                acc_b = self.entity_manager.get_component(id_b, ForceAccumulatorComponent)
-                if acc_b:
-                    force_label_prefix_b = "CRod" if conn_k.connection_type == ConnectionType.ROD else "RopeTension"
-                    acc_b.record_force_detail(
-                        force_vector=force_on_B_k,
-                        application_point_local=p_b_local,
-                        force_type_label=f"{force_label_prefix_b}_{conn_k.id.hex[:4]}_{id_b.hex[:4]}",
-                        is_visualization_only=True
-                    )
+                    # print(f"[DEBUG_CSS_FORCE_REC] Rope/Rod: {conn_k.id.hex[:4]}, Lambda_k: {lambda_k_val:.4f}") # REMOVED
+                    # print(f"  Entity A: {id_a.hex[:4]}, Fixed: {data_a['physics'].is_fixed}, Force: Vector2D({f_k_gen[0]:.4f}, {f_k_gen[1]:.4f})") # REMOVED
+                    # print(f"  Entity B: {id_b.hex[:4]}, Fixed: {data_b['physics'].is_fixed}, Force: Vector2D({f_k_gen[3]:.4f}, {f_k_gen[4]:.4f})") # REMOVED
+
+                    # Force on A
+                    acc_a = self.entity_manager.get_component(id_a, ForceAccumulatorComponent)
+                    if acc_a and not data_a['physics'].is_fixed:
+                        acc_a.record_force_detail(
+                            force_vector=Vector2D(f_k_gen[0], f_k_gen[1]),
+                            application_point_local=p_a_local,
+                            force_type_label=f"{force_label_prefix}_{conn_k.id.hex[:4]}_{id_a.hex[:4]}",
+                            is_visualization_only=False) # MODIFIED: Apply this force
+                        # Also add to net_force and net_torque
+                        constraint_force_on_a = Vector2D(f_k_gen[0], f_k_gen[1])
+                        constraint_torque_on_a = p_a_local.rotate(data_a['transform'].angle).cross(constraint_force_on_a)
+                        acc_a.add_force(constraint_force_on_a)
+                        acc_a.add_torque(constraint_torque_on_a)
+                        # print(f"DEBUG_CSS: Applied constraint force {constraint_force_on_a} and torque {constraint_torque_on_a} to entity {id_a} from {force_label_prefix}")
+                    # Force on B
+                    acc_b = self.entity_manager.get_component(id_b, ForceAccumulatorComponent)
+                    if acc_b and not data_b['physics'].is_fixed:
+                        acc_b.record_force_detail(
+                            force_vector=Vector2D(f_k_gen[3], f_k_gen[4]),
+                            application_point_local=p_b_local,
+                            force_type_label=f"{force_label_prefix}_{conn_k.id.hex[:4]}_{id_b.hex[:4]}",
+                            is_visualization_only=False) # MODIFIED: Apply this force
+                        # Also add to net_force and net_torque
+                        constraint_force_on_b = Vector2D(f_k_gen[3], f_k_gen[4])
+                        constraint_torque_on_b = p_b_local.rotate(data_b['transform'].angle).cross(constraint_force_on_b)
+                        acc_b.add_force(constraint_force_on_b)
+                        acc_b.add_torque(constraint_torque_on_b)
+                        # print(f"DEBUG_CSS: Applied constraint force {constraint_force_on_b} and torque {constraint_torque_on_b} to entity {id_b} from {force_label_prefix}")
+
+                elif conn_k.connection_type == ConnectionType.REVOLUTE_JOINT:
+                    lambda_x = lambda_global_np[processed_lambda_idx]
+                    lambda_y = lambda_global_np[processed_lambda_idx+1]
+                    lambda_x = -lambda_x # Sign convention for reaction force
+                    lambda_y = -lambda_y # Sign convention
+                    processed_lambda_idx += 2
+
+                    if abs(lambda_x) < EPSILON and abs(lambda_y) < EPSILON:
+                        continue
+
+                    pos_A = data_a['transform'].position
+                    angle_A = data_a['transform'].angle
+                    R_A_np_fc = self._get_rotation_matrix(angle_A)
+                    p_A_local_np_fc = np.array([p_a_local.x, p_a_local.y])
+                    pA_world_offset_np_fc = R_A_np_fc @ p_A_local_np_fc
+                    pA_world_offset_fc = Vector2D(pA_world_offset_np_fc[0], pA_world_offset_np_fc[1])
+                    
+                    # J_A^T = [[1,               0              ],
+                    #          [0,               1              ],
+                    #          [-pA_world_offset_fc.y, pA_world_offset_fc.x]]
+                    # f_gen_A = J_A^T * [lambda_x, lambda_y]^T
+                    force_on_A_x = lambda_x
+                    force_on_A_y = lambda_y
+                    # torque_on_A = -lambda_x * pA_world_offset_fc.y + lambda_y * pA_world_offset_fc.x
+                    
+                    acc_a = self.entity_manager.get_component(id_a, ForceAccumulatorComponent)
+                    if acc_a and not data_a['physics'].is_fixed: # Should always be dynamic
+                        acc_a.record_force_detail(
+                            force_vector=Vector2D(force_on_A_x, force_on_A_y),
+                            application_point_local=p_a_local, # Force applied at anchor point on A
+                            force_type_label=f"CRevolute_{conn_k.id.hex[:4]}_{id_a.hex[:4]}",
+                            is_visualization_only=False # MODIFIED: Apply this force
+                        )
+                        # Also add to net_force and net_torque
+                        constraint_force_on_A_rev = Vector2D(force_on_A_x, force_on_A_y)
+                        # Torque for revolute joint constraint force is more complex if the force itself isn't just canceling net external forces.
+                        # The lambda directly gives the constraint force. Its application point is p_a_local.
+                        constraint_torque_on_A_rev = p_a_local.rotate(data_a['transform'].angle).cross(constraint_force_on_A_rev)
+                        acc_a.add_force(constraint_force_on_A_rev)
+                        acc_a.add_torque(constraint_torque_on_A_rev)
+                        # print(f"DEBUG_CSS: Applied constraint force {constraint_force_on_A_rev} and torque {constraint_torque_on_A_rev} to entity {id_a} from CRevolute")
+                    
+                    # Force on B (the other body of the joint)
+                    id_B_fc = conn_k.target_entity_id # Renamed for clarity
+                    data_B_fc = entity_data_map[id_B_fc]
+                    if not data_B_fc['physics'].is_fixed: # If body B is dynamic
+                        acc_b_fc = self.entity_manager.get_component(id_B_fc, ForceAccumulatorComponent)
+                        if acc_b_fc:
+                            # Force on B is opposite to force on A (Newton's 3rd law for contact point)
+                            force_on_B_x = -force_on_A_x
+                            force_on_B_y = -force_on_A_y
+                            p_B_local_fc = conn_k.connection_point_b # Anchor point on B
+
+                            acc_b_fc.record_force_detail(
+                                force_vector=Vector2D(force_on_B_x, force_on_B_y),
+                                application_point_local=p_B_local_fc,
+                                force_type_label=f"CRevolute_{conn_k.id.hex[:4]}_{id_B_fc.hex[:4]}",
+                                is_visualization_only=False # MODIFIED: Apply this force
+                            )
+                            # Also add to net_force and net_torque
+                            constraint_force_on_B_rev = Vector2D(force_on_B_x, force_on_B_y)
+                            constraint_torque_on_B_rev = p_B_local_fc.rotate(data_B_fc['transform'].angle).cross(constraint_force_on_B_rev)
+                            acc_b_fc.add_force(constraint_force_on_B_rev)
+                            acc_b_fc.add_torque(constraint_torque_on_B_rev)
+                            # print(f"DEBUG_CSS: Applied constraint force {constraint_force_on_B_rev} and torque {constraint_torque_on_B_rev} to entity {id_B_fc} from CRevolute")
         # else: No constraints or lambdas are zero, no forces to record.
 
         return result_accelerations

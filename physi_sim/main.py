@@ -53,7 +53,7 @@ def main():
     main_window.show()
 
     # --- Solver Module Test --- Restore
-    print("\n--- Testing SolverModule ---")
+    # print("\n--- Testing SolverModule ---")
     solver_module = SolverModule()
     # test_eqs = ["v_final = v_initial + a * t", "v_initial = 0", "a = 9.81", "t = 2"]
     # test_unks = ["v_final", "v_initial", "a", "t"] # Include knowns if they appear in equations
@@ -67,9 +67,9 @@ def main():
     test_eqs_3 = ["x + y - 10", "2*x - y - 5"]
     test_unks_3 = ["x", "y"]
     solution = solver_module.solve_algebraic_system(test_eqs_3, test_unks_3)
-    print(f"Solving {test_eqs_3} for {test_unks_3}:")
-    print(f"Solution: {solution}")
-    print("--------------------------")
+    # print(f"Solving {test_eqs_3} for {test_unks_3}:")
+    # print(f"Solution: {solution}")
+    # print("--------------------------")
 
     sys.exit(app.exec())
 
